@@ -1,0 +1,52 @@
+octomap_server:
+  ros__parameters:
+
+    # ── Map resolution ───────────────────────────────────────────────
+    # 0.2m = good balance for indoor + warehouse at A010 range (3m)
+    # Lower (0.1m) = finer detail but 8× more memory; tune after testing
+    resolution: 0.2
+
+    # ── Frame IDs ────────────────────────────────────────────────────
+    frame_id: map                   # world/fixed frame for the map
+    base_frame_id: base_link        # robot body frame
+
+    # TF lookup tolerance — critical for simulation where
+    # sensor stamps and TF timestamps can drift slightly
+    transform_tolerance: 0.2        # seconds — increase if TF warnings persist
+
+    # ── Sensor input ─────────────────────────────────────────────────
+    # We feed the merged cloud, not individual sensors
+    # (remapped in launch file)
+
+    # ── Occupancy thresholds ─────────────────────────────────────────
+    # Cells above occupancy_thres are considered OCCUPIED
+    # Cells below free_thres are considered FREE
+    occupancy_thres: 0.65           # conservative — avoids false positives
+    prob_hit:  0.7                  # probability update on hit
+    prob_miss: 0.4                  # probability update on miss
+    thres_min: 0.12                 # log-odds clamp min
+    thres_max: 0.97                 # log-odds clamp max
+
+    # ── Range filtering ──────────────────────────────────────────────
+    # Must match A010 clip range (near=0.2m, far=3.0m)
+    sensor_model_min_range: 0.2
+    sensor_model_max_range: 3.0
+
+    # ── Map bounds (metres) ──────────────────────────────────────────
+    # Set generously for indoor/warehouse. Octomap only allocates
+    # nodes that are actually observed, so large bounds are fine.
+    # Z range: -1m below ground to 5m above (adjust for your space)
+    filter_ground: true             # filter ground plane — prevents floor from blocking VFH3D
+    ground_filter_distance: 0.05    # metres tolerance for ground detection
+    ground_filter_angle: 0.15       # radians — max slope considered ground
+    ground_filter_plane_distance: 0.07
+    filter_speckles: true           # remove isolated single voxels
+
+    # ── Compression ──────────────────────────────────────────────────
+    # Compress identical child nodes into parent — saves ~40% memory
+    compress_map: true
+
+    # ── Latched map publishing ────────────────────────────────────────
+    # Publishes full map periodically (useful for global planner)
+    # Set to 0 to disable periodic full publish (only incremental)
+    latch: false

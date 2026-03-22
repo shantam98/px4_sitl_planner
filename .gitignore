@@ -1,0 +1,28 @@
+# ROS2
+build/
+install/
+log/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# C++
+*.o
+*.so
+*.a
+*.out
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store

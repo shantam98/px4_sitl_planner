@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>uav_control</name>
+  <version>0.1.0</version>
+  <description>Setpoint publisher — VFH3D cmd_vel to PX4 TrajectorySetpoint</description>
+  <maintainer email="you@example.com">you</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>px4_msgs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

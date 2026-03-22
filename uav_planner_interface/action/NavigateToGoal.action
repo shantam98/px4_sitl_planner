@@ -1,0 +1,11 @@
+# Goal
+geometry_msgs/PoseStamped target_pose
+float32 planning_timeout_sec
+---
+# Result
+nav_msgs/Path global_path
+string result_code
+---
+# Feedback
+float32 percent_complete
+string status_msg

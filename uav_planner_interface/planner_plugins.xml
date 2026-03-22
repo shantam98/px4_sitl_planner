@@ -1,0 +1,7 @@
+<library path="astar_planner">
+  <class name="uav_planning::AStarPlanner"
+         type="uav_planning::AStarPlanner"
+         base_class_type="uav_planning::GlobalPlannerBase">
+    <description>3D A* planner on OctoMap with obstacle inflation</description>
+  </class>
+</library>
