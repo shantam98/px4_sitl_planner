@@ -1,0 +1,49 @@
+mp_node:
+  ros__parameters:
+
+    # ── Arc primitive geometry ────────────────────────────────────────────
+    # Total horizontal arcs = num_az_horizontal × num_curvatures (default: 18×5 = 90)
+    num_az_horizontal: 18        # azimuth directions (20° spacing)
+    num_curvatures:    5         # curvature samples: [-κ_max .. 0 .. +κ_max]
+    max_curvature:     0.4       # 1/m  →  min turning radius = 2.5 m at max_speed
+    arc_length:        2.0       # primitive length (m), matches A010 sensor range
+
+    # ── Pitched layers (ceiling / floor detection) ────────────────────────
+    # Straight-line segments; one layer per angle, num_az_pitched per layer.
+    # Total pitched primitives = len(elevation_angles_deg) × num_az_pitched (default: 4×18 = 72)
+    elevation_angles_deg: [30.0, 15.0, -15.0, -30.0]
+    num_az_pitched: 18
+
+    # ── Collision geometry ────────────────────────────────────────────────
+    collision_radius: 0.45       # m  — robot radius (0.30) + safety margin (0.15)
+    min_clearance:    0.6        # m  — e-stop trigger distance
+
+    # ── Speed limits ─────────────────────────────────���────────────────────
+    max_speed: 2.5               # m/s  horizontal ceiling
+    min_speed: 0.2               # m/s  floor when near obstacle
+    max_vz:    1.0               # m/s  vertical ceiling
+    alt_kp:    0.8               # altitude P-gain (vz = alt_kp × height_error)
+
+    # ── Direction scoring weights ─────────────────────────────────────────
+    # cost = w_goal × Δangle_to_goal + w_prev × Δangle_to_prev_primitive
+    w_goal: 3.0
+    w_prev: 2.0
+
+    # ── Temporal point buffer ────────────────────────────��────────────────
+    # Circular FIFO in base_link frame. Covers sensor blind spots during yaw.
+    # Memory ≈ history_capacity × 12 bytes  (default: 2048 × 12 = 24 KB)
+    history_capacity:  2048      # max stored points
+    history_subsample: 4         # keep 1-in-N from each incoming cloud
+
+    # ── Stall detection ───────────────────────────────────────────────────
+    # Uses a bounding-box approach over a sliding time window so that VIO
+    # drift (slow centroid walk) does not suppress detection.
+    # A drone orbiting with radius r has a box diagonal of ~2r.
+    # Tune stall_radius_xy to be larger than expected VIO drift but smaller
+    # than the smallest orbit you want to catch (typically 0.6–1.0 m).
+    stall_window_sec:  3.0   # seconds of position history to evaluate
+    stall_radius_xy:   0.8   # m — box diagonal threshold; fire if below this
+    stall_min_samples: 15    # require ≥ N samples (~0.75 s) before firing
+
+    # ── Control rate ──────────────────────────────────────────────────────
+    update_rate_hz: 20.0

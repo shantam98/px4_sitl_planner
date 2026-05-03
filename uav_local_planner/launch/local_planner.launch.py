@@ -1,10 +1,16 @@
+import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
 
 def generate_launch_description():
+    pkg = get_package_share_directory('uav_local_planner')
+    mp_config = os.path.join(pkg, 'config', 'mp_params.yaml')
+
     use_mp = LaunchConfiguration('use_mp', default='true')
 
     return LaunchDescription([
@@ -27,29 +33,18 @@ def generate_launch_description():
             }],
         ),
 
-        # ── Motion Primitive planner (default) ────────────────────────
+        # ── Motion Primitive planner (default) ─────────���──────────────────
+        # All tuning lives in config/mp_params.yaml
         Node(
             condition=IfCondition(use_mp),
             package='uav_local_planner',
             executable='mp_node',
             name='mp_node',
             output='screen',
-            parameters=[{
-                'num_primitives':   72,
-                'primitive_length': 2.0,
-                'collision_radius': 0.45,
-                'max_speed':        2.5,
-                'min_speed':        0.2,
-                'max_vz':           1.0,
-                'min_clearance':    0.6,
-                'w_goal':           3.0,
-                'w_prev':           2.0,
-                'alt_kp':           0.8,
-                'update_rate_hz':   20.0,
-            }],
+            parameters=[mp_config],
         ),
 
-        # ── Legacy VFH3D (OctoMap-based) — set use_mp:=false to enable ─
+        # ── Legacy VFH3D (OctoMap-based) — launch with use_mp:=false ──────
         Node(
             condition=UnlessCondition(use_mp),
             package='uav_local_planner',

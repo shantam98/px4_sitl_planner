@@ -9,24 +9,43 @@
 namespace uav_local_planner {
 
 struct MPConfig {
-  int    num_primitives   = 72;    // horizontal directions (360° / 5° = 72)
-  double primitive_length = 2.0;  // metres — matches A010 max range
-  double collision_radius = 0.45; // robot_radius (0.30) + safety_margin (0.15)
-  double max_speed        = 2.5;  // m/s horizontal
-  double min_speed        = 0.2;  // m/s — floor when close to obstacle
-  double max_vz           = 1.0;  // m/s vertical
-  double min_clearance    = 0.6;  // e-stop distance (metres)
-  double w_goal           = 3.0;  // weight: angular distance to goal direction
-  double w_prev           = 2.0;  // weight: angular distance to previous primitive
-  double alt_kp           = 0.8;  // P-gain for altitude error → vz
+  // ── Arc primitive geometry ──────────────────────────────────────────
+  int    num_az_horizontal = 18;    // azimuth directions (20° spacing)
+  int    num_curvatures    = 5;     // curvature samples per direction
+  double max_curvature     = 0.4;   // 1/m → min turning radius = 2.5 m
+  double arc_length        = 2.0;   // metres, matches A010 max range
+
+  // ── Pitched layers (ceiling / floor detection) ──────────────────────
+  std::vector<double> elevation_angles_deg = {30.0, 15.0, -15.0, -30.0};
+  int    num_az_pitched    = 18;    // azimuth directions per pitched layer
+
+  // ── Collision geometry ───────────────────────────────────────────────
+  double collision_radius  = 0.45;  // m — robot radius + safety margin
+  double min_clearance     = 0.6;   // m — e-stop distance
+
+  // ── Speed limits ─────────────────────────────────────────────────────
+  double max_speed         = 2.5;   // m/s horizontal
+  double min_speed         = 0.2;   // m/s floor near obstacles
+  double max_vz            = 1.0;   // m/s vertical
+  double alt_kp            = 0.8;   // altitude P-gain
+
+  // ── Scoring weights ──────────────────────────────────────────────────
+  double w_goal            = 3.0;   // angular cost toward goal direction
+  double w_prev            = 2.0;   // angular cost toward previous primitive
+
+  // ── Temporal point buffer ────────────────────────────────────────────
+  // Points stored in base_link frame. Primary benefit: recovering blind spots
+  // during yaw manoeuvres (translation drift is acceptable for short windows).
+  int    history_capacity  = 2048;  // max buffered points from past frames
+  int    history_subsample = 4;     // keep 1-in-N points from each new cloud
 };
 
 struct MPResult {
-  Eigen::Vector3d velocity;           // in map (ENU) frame
+  Eigen::Vector3d velocity;         // map (ENU) frame
   bool   estop;
   bool   obstacle_detected;
   double closest_obstacle_dist;
-  int    best_primitive;             // index into directions_, -1 if none valid
+  int    best_primitive_idx;        // index into horiz_prims_, -1 if none
 };
 
 class MotionPrimitives {
@@ -34,9 +53,9 @@ public:
   explicit MotionPrimitives(const MPConfig& cfg);
 
   // Primary update — call at 20 Hz.
-  // cloud     : merged ToF cloud in base_link frame
+  // cloud     : fused ToF cloud in base_link frame
   // drone_pos : position in map frame (ENU)
-  // drone_yaw : yaw angle in map frame (radians)
+  // drone_yaw : yaw in map frame (radians)
   // waypoint  : target in map frame (ENU)
   MPResult update(
       const pcl::PointCloud<pcl::PointXYZ>& cloud,
@@ -46,22 +65,56 @@ public:
 
   void reset();
 
-private:
-  // Minimum distance from point p (in base_link frame) to primitive segment
-  // Segment runs from origin to direction_[i] * primitive_length.
-  double pointToSegmentDist(
-      const Eigen::Vector3d& p,
-      const Eigen::Vector3d& seg_end) const;
+  // Read-only access for diagnostics
+  int numHorizPrims() const { return static_cast<int>(horiz_prims_.size()); }
+  int numPitchedPrims() const { return static_cast<int>(pitched_prims_.size()); }
 
-  double adaptiveSpeed(double closest_dist) const;
+private:
+  // ── Pre-computed arc geometry ────────────────────────────────────────
+  struct ArcGeom {
+    Eigen::Vector2d center;   // arc center in XY (base_link)
+    double R;                 // signed radius = 1/κ
+    double alpha_start;       // angle from center to arc start (origin)
+    double delta_theta;       // signed arc span = κ * arc_length
+    Eigen::Vector2d end_xy;   // arc endpoint in XY
+  };
+
+  struct Primitive {
+    Eigen::Vector3d end_point;   // 3D terminal point in base_link
+    double az_angle;             // initial heading azimuth (radians)
+    double elevation_rad;        // elevation angle (0 for horizontal)
+    double curvature;            // κ (0 = straight)
+    double terminal_az;          // az_angle + κ·arc_length (for scoring)
+    bool   is_curved;
+    ArcGeom arc;                 // valid only when is_curved == true
+  };
+
+  void buildPrimitives();
+  void updateBuffer(const pcl::PointCloud<pcl::PointXYZ>& cloud);
+
+  // Analytic 2D distance from (px,py) to a constant-curvature arc
+  double pointToArcDist2D(double px, double py, const ArcGeom& a) const;
+
+  // 3D point-to-segment distance; segment runs from origin to seg_end
+  double pointToSegmentDist(const Eigen::Vector3d& p,
+                            const Eigen::Vector3d& seg_end) const;
+
+  // Combined speed: min of distance-ramp and valid-fraction-density
+  double adaptiveSpeed(double closest_dist, double valid_fraction) const;
+
+  static double normalizeAngle(double a);
 
   MPConfig cfg_;
 
-  // Pre-computed horizontal unit-direction vectors (in base_link frame).
-  // Index 0 = forward (+x), increasing counter-clockwise.
-  std::vector<Eigen::Vector3d> directions_;
+  std::vector<Primitive> horiz_prims_;    // curved arcs at elevation = 0
+  std::vector<Primitive> pitched_prims_;  // straight rays at ±15°, ±30°
 
-  int prev_primitive_{-1};
+  // Circular FIFO of cloud points in base_link frame (Eigen float saves memory)
+  std::vector<Eigen::Vector3f> point_buf_;
+  int write_head_{0};
+  int buf_fill_{0};
+
+  int prev_best_{-1};
 };
 
 }  // namespace uav_local_planner

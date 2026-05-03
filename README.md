@@ -10,7 +10,7 @@ A ROS 2 (Humble) obstacle avoidance system for UAVs with two interchangeable loc
 Sensing          5× A010 ToF cameras (100×100, 20 Hz, 72° horizontal ring)
                  + RGBD front camera + bottom depth camera
       ↓
-Fusion           cloud_merge — merges point clouds into base_link frame,
+Fusion           uav_depth_fusion — merges point clouds into base_link frame,
                  bridges PX4 odometry NED→ENU, broadcasts static sensor TFs
       ↓
 Mapping          uav_mapping — OctoMap 3D occupancy (0.2 m voxels)
@@ -32,7 +32,7 @@ Control          uav_control — velocity setpoints → PX4 TrajectorySetpoint (
 
 | Package | Description |
 |---|---|
-| `cloud_merge` | Point cloud merge node, static TF broadcaster, PX4 odometry bridge (NED→ENU) |
+| `uav_depth_fusion` | Point cloud merge node, static TF broadcaster, PX4 odometry bridge (NED→ENU) |
 | `uav_mapping` | OctoMap server configuration and launch |
 | `uav_planner_interface` | `GlobalPlannerBase` plugin interface, A* planner plugin, action server |
 | `uav_local_planner` | Motion Primitive Library (default) + legacy 3DVFH+, waypoint manager |
@@ -110,7 +110,7 @@ source install/setup.bash
 ```
 
 ### 2. Configure sensor transforms
-Edit `cloud_merge/src/tf_static_broadcaster.cpp` if your sensor mounting positions differ from the default F450 layout:
+Edit `uav_depth_fusion/src/tf_static_broadcaster.cpp` if your sensor mounting positions differ from the default F450 layout:
 
 | Sensor | Position (x, y, z) | Yaw |
 |---|---|---|
@@ -137,7 +137,7 @@ ros2 run ros_gz_bridge parameter_bridge \
 
 ```bash
 # Terminal 1 — sensor fusion + TF + odometry bridge
-ros2 launch cloud_merge fusion.launch.py
+ros2 launch uav_depth_fusion fusion.launch.py
 
 # Terminal 2 — global planner (requires OctoMap)
 ros2 launch uav_mapping mapping.launch.py
@@ -213,7 +213,7 @@ Set **Fixed Frame** to `map`, then add:
 
 ## Parameters
 
-### cloud_merge
+### uav_depth_fusion
 | Parameter | Default | Description |
 |---|---|---|
 | `target_frame` | `base_link` | Frame to merge clouds into |
