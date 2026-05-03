@@ -31,54 +31,53 @@
 #include <mutex>
 #include <cmath>
 
-// ── Bounding-box stall detector ───────────────────────────────────────────
-// Tracks XY positions over a sliding time window. If the diagonal of the
-// bounding box stays below stall_radius_xy, the drone is considered stalled.
+// ── Goal-progress stall detector ──────────────────────────────────────────
+// Stall condition: the drone has not made meaningful progress toward the goal
+// over a sliding window, regardless of how much ground it covered.
 //
-// Uses the bounding box (not centroid distance) so that VIO drift — which
-// slowly walks the centroid but keeps the box compact — does not suppress
-// detection. A drone orbiting in a tight circle will have a box diagonal of
-// ~2× orbit radius, exposing it even when centroid displacement is small.
+// This correctly handles both failure modes:
+//   - Tight orbit: bounding box is large but dist_to_goal never shrinks → stall
+//   - Slow approach near obstacle: dist_to_goal steadily shrinks → no stall
+//   - VIO drift on hover: dist_to_goal unchanged but have_waypoint is false
+//     so the detector never runs
+//
+// progress = initial_dist_to_goal − best (minimum) dist_to_goal seen in window
+// If progress < progress_min over the full window → STALLED.
 struct StallDetector {
-  struct Sample { rclcpp::Time t; double x, y; };
+  struct Sample { rclcpp::Time t; double dist_to_goal; };
 
   double window_sec    = 3.0;   // sliding window length
-  double radius_xy     = 0.8;   // bounding-box diagonal threshold (metres)
-  int    min_samples   = 15;    // require ≥ this many samples before firing
+  double progress_min  = 0.3;   // must close dist_to_goal by this much (metres)
+  double ignore_radius = 1.0;   // skip check if already this close to goal
+  int    min_samples   = 45;    // fill ~window before firing (20 Hz × 2.25 s)
   bool   stalled       = false;
 
   std::deque<Sample> buf;
 
   void reset() { buf.clear(); stalled = false; }
 
-  // Call once per update cycle with the current XY position and wall time.
-  void update(double x, double y, rclcpp::Time now)
+  // Pass current XY distance to goal each cycle.
+  void update(double dist_to_goal, rclcpp::Time now)
   {
-    buf.push_back({now, x, y});
+    // Already at goal — waypoint_manager should fire mission_complete soon
+    if (dist_to_goal < ignore_radius) { stalled = false; return; }
+
+    buf.push_back({now, dist_to_goal});
 
     // Prune entries older than the window
     while (!buf.empty() &&
            (now - buf.front().t).seconds() > window_sec)
       buf.pop_front();
 
-    if (static_cast<int>(buf.size()) < min_samples) {
-      stalled = false;
-      return;
-    }
+    if (static_cast<int>(buf.size()) < min_samples) { stalled = false; return; }
 
-    // Bounding box in XY
-    double xmin = buf.front().x, xmax = xmin;
-    double ymin = buf.front().y, ymax = ymin;
-    for (const auto& s : buf) {
-      xmin = std::min(xmin, s.x); xmax = std::max(xmax, s.x);
-      ymin = std::min(ymin, s.y); ymax = std::max(ymax, s.y);
-    }
+    // Best progress = how much closer to goal we got at any point in the window
+    const double initial_dist = buf.front().dist_to_goal;
+    double min_dist = initial_dist;
+    for (const auto& s : buf)
+      min_dist = std::min(min_dist, s.dist_to_goal);
 
-    const double diag = std::sqrt(
-        (xmax - xmin) * (xmax - xmin) +
-        (ymax - ymin) * (ymax - ymin));
-
-    stalled = (diag < radius_xy);
+    stalled = ((initial_dist - min_dist) < progress_min);
   }
 };
 
@@ -121,9 +120,10 @@ public:
     cfg.history_subsample = declare_parameter("history_subsample", 4);
 
     // Stall detection
-    stall_.window_sec  = declare_parameter("stall_window_sec",  3.0);
-    stall_.radius_xy   = declare_parameter("stall_radius_xy",   0.8);
-    stall_.min_samples = declare_parameter("stall_min_samples", 15);
+    stall_.window_sec    = declare_parameter("stall_window_sec",   3.0);
+    stall_.progress_min  = declare_parameter("stall_progress_min", 0.3);
+    stall_.ignore_radius = declare_parameter("stall_ignore_radius",1.0);
+    stall_.min_samples   = declare_parameter("stall_min_samples",  45);
 
     double rate_hz = declare_parameter("update_rate_hz", 20.0);
 
@@ -131,12 +131,12 @@ public:
 
     RCLCPP_INFO(get_logger(),
         "MPNode: %d horiz arcs (%d az × %d κ) + %d pitched segments, %.0f Hz | "
-        "stall: %.1fs window / %.2fm bbox",
+        "stall: %.1fs window / %.2fm progress_min / %.1fm ignore_radius",
         planner_->numHorizPrims(),
         cfg.num_az_horizontal, cfg.num_curvatures,
         planner_->numPitchedPrims(),
         rate_hz,
-        stall_.window_sec, stall_.radius_xy);
+        stall_.window_sec, stall_.progress_min, stall_.ignore_radius);
 
     // ── Subscribers ──────────────────────────────────────────────────────
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -222,13 +222,14 @@ private:
       wp = waypoint_;
     }
 
-    stall_.update(pos.x(), pos.y(), get_clock()->now());
+    const double dist_to_goal = (pos.head<2>() - wp.head<2>()).norm();
+    stall_.update(dist_to_goal, get_clock()->now());
 
     if (stall_.stalled) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "STALLED: XY bounding box < %.2fm over %.1fs — hovering. "
+          "STALLED: no progress toward goal (< %.2fm) over %.1fs — hovering. "
           "Send a new waypoint to resume.",
-          stall_.radius_xy, stall_.window_sec);
+          stall_.progress_min, stall_.window_sec);
       status.data = "STALLED";
       status_pub_->publish(status);
       geometry_msgs::msg::TwistStamped cmd;

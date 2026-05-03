@@ -36,14 +36,15 @@ mp_node:
     history_subsample: 4         # keep 1-in-N from each incoming cloud
 
     # ── Stall detection ───────────────────────────────────────────────────
-    # Uses a bounding-box approach over a sliding time window so that VIO
-    # drift (slow centroid walk) does not suppress detection.
-    # A drone orbiting with radius r has a box diagonal of ~2r.
-    # Tune stall_radius_xy to be larger than expected VIO drift but smaller
-    # than the smallest orbit you want to catch (typically 0.6–1.0 m).
-    stall_window_sec:  3.0   # seconds of position history to evaluate
-    stall_radius_xy:   0.8   # m — box diagonal threshold; fire if below this
-    stall_min_samples: 15    # require ≥ N samples (~0.75 s) before firing
+    # Goal-progress approach: stall fires if the drone hasn't closed the
+    # distance to its goal by stall_progress_min metres within stall_window_sec.
+    # This catches circular orbits of any radius (dist_to_goal stays flat)
+    # without false-triggering on slow-but-genuine obstacle approach (dist
+    # steadily shrinks).  Ignored when drone is already within ignore_radius.
+    stall_window_sec:   3.0  # sliding window length (s)
+    stall_progress_min: 0.3  # must close dist_to_goal by this much (m) or → stall
+    stall_ignore_radius: 1.0 # skip stall check if already this close to goal (m)
+    stall_min_samples:  45   # require ≥ N samples before firing (20 Hz × 2.25 s)
 
     # ── Control rate ──────────────────────────────────────────────────────
     update_rate_hz: 20.0
