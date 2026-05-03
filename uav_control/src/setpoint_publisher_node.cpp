@@ -37,7 +37,7 @@ public:
   {
     // ── Parameters ───────────────────────────────────────────────────
     publish_rate_hz_  = declare_parameter("publish_rate_hz",  20.0);
-    takeoff_height_   = declare_parameter("takeoff_height",   -5.0); // NED negative=up
+    takeoff_height_   = declare_parameter("takeoff_height",   -2.0); // NED negative=up
     takeoff_threshold_= declare_parameter("takeoff_threshold", 0.8); // fraction of height
     startup_delay_s_  = declare_parameter("startup_delay_s",   5.0);
     cmd_timeout_s_    = declare_parameter("cmd_timeout_s",     0.5);
