@@ -9,6 +9,7 @@ A ROS 2 (Humble) obstacle avoidance system for UAVs with two interchangeable loc
 ```
 Sensing          5× A010 ToF cameras (100×100, 20 Hz, 72° horizontal ring)
                  + RGBD front camera + bottom depth camera
+                 + Stereo IR pair (D415-equivalent, sim — for VSLAM)
       ↓
 Fusion           uav_depth_fusion — merges point clouds into base_link frame,
                  bridges PX4 odometry NED→ENU, broadcasts static sensor TFs
@@ -28,11 +29,27 @@ Control          uav_control — velocity setpoints → PX4 TrajectorySetpoint (
 
 ---
 
+## Current Roadmap
+
+The stack is being upgraded from geometric-only SLAM (PX4 EKF2 + OctoMap) to a vision-grounded perception pipeline (Isaac ROS cuVSLAM + nvblox + optional VLM-derived semantics).
+
+| Phase | Status | What |
+|---|---|---|
+| **1 — Sim plumbing** | ✅ Done | Stereo IR pair added to f450 SDF; `sensor_bridge.yaml` extended; `stereo_camera_info_publisher` workaround for Gazebo Harmonic; `isaac_vslam.sif` Singularity container with cuVSLAM + nvblox (verified to load on GPU). |
+| **2 — Config + launch wiring** | 🚧 In progress | `publish_map_to_odom` gate in `tf_static_broadcaster`; central `vslam.yaml`; new `vslam.launch.py`; `with_vslam` arg in `full_stack.launch.py`. See `PHASE2_VSLAM_INTEGRATION.md`. |
+| **3 — nvblox replaces OctoMap** | Planned | Rewire A* and frontier explorer to consume nvblox ESDF/occupancy; drop `uav_mapping` when `with_vslam:=true`. |
+| **4 — Map persistence** | Planned | `/uav/save_map`, `/uav/load_map`; round-trip cuVSLAM + nvblox between sessions. |
+| **5 — PX4 vision feedback** | Planned, flag-gated | `vslam_to_px4_bridge` publishes cuVSLAM pose to `/fmu/in/vehicle_visual_odometry`; EKF2 fuses visual pose. Default off. |
+| **6 — Semantic layer** | Planned, hand-off ready | VLM-enriched keyframe DB + nvblox semantic channel + semantic-aware frontier scoring. See `SEMANTIC_LAYER.md`. |
+| **7 — Hardware deploy** | Planned | Native JetPack install on Orin Nano; swap image source from `ros_gz_bridge` to `realsense2_camera`. Same node config. |
+
+---
+
 ## Packages
 
 | Package | Description |
 |---|---|
-| `uav_depth_fusion` | Point cloud merge node, static TF broadcaster, PX4 odometry bridge (NED→ENU) |
+| `uav_depth_fusion` | Point cloud merge node, static TF broadcaster, PX4 odometry bridge (NED→ENU), static stereo `camera_info` publisher (Gazebo Harmonic workaround) |
 | `uav_mapping` | OctoMap server configuration and launch |
 | `uav_planner_interface` | `GlobalPlannerBase` plugin interface, A* planner plugin, action server |
 | `uav_local_planner` | Motion Primitive Library (default) + legacy 3DVFH+, waypoint manager |
@@ -298,7 +315,7 @@ No changes to any other node required.
 
 ```
 map
-└── odom                          (static identity — replace with SLAM)
+└── odom                          (static identity today; cuVSLAM-driven once Phase 2 lands)
     └── base_link                 (PX4 odometry, NED→ENU converted)
         ├── tof_array_link        (identity joint)
         │   ├── tof_0_link        (front, 0°)
@@ -307,17 +324,44 @@ map
         │   ├── tof_3_link        (rear-right, -144°)
         │   └── tof_4_link        (front-right, -72°)
         ├── rgbd_cam_link         (front RGBD, 0.2 m forward)
-        └── bottom_cam_link       (downward, pitched 90°)
+        ├── bottom_cam_link       (downward, pitched 90°)
+        ├── stereo_left_cam_link  (D415-equivalent IR,  +0.0275 m Y, +0.2 m X)
+        └── stereo_right_cam_link (D415-equivalent IR,  −0.0275 m Y, +0.2 m X)
 ```
 
 ---
 
 ## Known Limitations & Future Work
 
-- `map → odom` is a static identity transform. Replace with a SLAM or VIO solution (e.g. RTAB-Map, ORB-SLAM3) for drift-free long-range navigation.
+### Localisation
+- `map → odom` is a static identity transform today. The selected fix is Isaac ROS **cuVSLAM** (stereo, optionally with IMU fusion). Phase 1 container build is complete; Phase 2 wiring is in progress (`PHASE2_VSLAM_INTEGRATION.md`).
+- PX4 EKF2 drift on `/drone/odom` is not corrected until Phase 5 (vision feedback to PX4). Short missions (<30 s) are unaffected; long missions accumulate drift that compounds at the bypass / waypoint level.
+
+### Perception / mapping
 - The Motion Primitive planner uses horizontal-only primitives matching the A010 sensor ring. Overhead and underfoot obstacles are not detected; altitude hold is the only vertical protection.
-- The A* planner treats unknown voxels as free. In highly unstructured environments consider switching to a conservative unknown=occupied policy once the map is sufficiently explored.
-- The global planner plugin interface is ready for ML-based planners — the `computePath()` signature accepts the full OctoMap and a feedback callback.
+- The A* planner currently treats unknown voxels as free. After Phase 3 (nvblox), the dense map will have a richer occupancy / ESDF representation.
+- Once nvblox is integrated, `uav_mapping` (OctoMap) is dropped when `with_vslam:=true`; the global planner consumes `nvblox_node/static_occupancy` instead.
+
+### Simulation quirks
+- **Gazebo Harmonic** does not auto-publish `sensor_msgs/CameraInfo` for `<sensor type="camera">` in our SDF. Worked around with `stereo_camera_info_publisher` (in `uav_depth_fusion`) emitting static intrinsics computed from the SDF's FOV/resolution. Real hardware (RealSense D415 + `realsense2_camera`) publishes `camera_info` natively, so this workaround is sim-only.
+- **Cluster `/tmp` is shared across users** (NUS Vanda). `run_server.sh` bind-mounts a per-user `/tmp` into the container to avoid `/tmp/px4_lock-<N>` collisions between users running the same instance ID.
+- **`libGstCameraSystem.so`** load failure in the PX4+Gazebo log is harmless — PX4's optional GStreamer streaming plugin isn't built into the current `uav_stack.sif` (no GStreamer dev libs). Spawn continues normally; RTSP video is unavailable but unused by this stack.
+
+### Extensibility
+- The global planner plugin interface is ready for ML-based planners — the `computePath()` signature accepts the full map and a feedback callback. After Phase 3 it will also accept nvblox ESDF for gradient-based optimisers.
+- The semantic layer (Phase 6) is designed as additive, gated on `vslam.yaml > semantic.enable`. Implementation plan in `SEMANTIC_LAYER.md`.
+
+---
+
+## Documentation
+
+| Doc | Purpose |
+|---|---|
+| `PHASE2_VSLAM_INTEGRATION.md` | Hand-off plan for wiring cuVSLAM + nvblox into the existing stack (Phase 2). File map, implementation order, verification. |
+| `SEMANTIC_LAYER.md` | Hand-off plan for the VLM-driven semantic layer + semantic-aware exploration (Phase 6). |
+| `../px4_sim/SERVER_SETUP.md` | Cluster setup guide — repo clones, container builds, run sequence. |
+| `../px4_sim/IsaacVslam.def` | Singularity definition for `isaac_vslam.sif` (cuVSLAM + nvblox container). |
+| `../px4_sim/Singularity.def` | Singularity definition for `uav_stack.sif` (planner stack + Gazebo container). |
 
 ---
 
