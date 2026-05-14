@@ -1,0 +1,38 @@
+# RealSense D415 parameters (reference)
+#
+# Currently the parameters are baked into realsense.launch.py as defaults plus
+# a couple of launch args (profile, emitter_enabled). This YAML is a HUMAN
+# REFERENCE of what the launch will set, and a place to drop overrides if we
+# move to a parameters-file pattern later.
+#
+# Validated on:
+#   - laptop USB 2 (2026-05-15): profile=640x480x15, partial streams
+#   - target deploy: Orin Nano USB 3 (pending validation)
+
+d415:
+  ros__parameters:
+    # ── Identity ─────────────────────────────────────────────
+    camera_name: d415
+    # serial_no: ""           # set if multiple realsense devices on the bus
+
+    # ── Streams ──────────────────────────────────────────────
+    enable_color: true
+    enable_depth: true
+    enable_infra1: true
+    enable_infra2: true
+    align_depth.enable: true
+
+    # ── No IMU on D415 ───────────────────────────────────────
+    enable_gyro: false
+    enable_accel: false
+
+    # ── Profile (overridden by launch arg) ───────────────────
+    # On USB 3 (Orin): 1280x720x30 across the board
+    # On USB 2 (dev laptop): 640x480x15 (and infra2 will be dropped — see
+    # https://github.com/IntelRealSense/librealsense/wiki/D400-USB2-Support)
+    depth_module.profile: "1280x720x30"
+    rgb_camera.profile:   "1280x720x30"
+
+    # ── Hardware sync + IR projector ─────────────────────────
+    enable_sync: true
+    depth_module.emitter_enabled: 1   # 0 for clean passive stereo cuVSLAM

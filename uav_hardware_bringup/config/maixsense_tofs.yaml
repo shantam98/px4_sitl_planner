@@ -1,0 +1,41 @@
+# MaixSense MS-A010 ToF sensor array — reference config
+#
+# Layout mirrors the simulation: 5 sensors arranged horizontally on tof_array_link,
+# 72 degrees apart (0, +72, +144, -144, -72 degrees yaw from base_link forward).
+#
+# Mapping:
+#   tof_0 = front           (0 deg)
+#   tof_1 = front-left     (+72 deg)
+#   tof_2 = rear-left     (+144 deg)
+#   tof_3 = rear-right    (-144 deg)
+#   tof_4 = front-right    (-72 deg)
+#
+# Device paths assume udev rules from udev/99-uav-hardware.rules are installed.
+# Without those rules, /dev/ttyUSB* assignments are non-deterministic and
+# directions WILL be scrambled across reboots.
+
+tofs:
+  - index: 0
+    direction: front
+    device:    /dev/maixsense_tof_0
+    frame:     tof_0_link
+  - index: 1
+    direction: front_left
+    device:    /dev/maixsense_tof_1
+    frame:     tof_1_link
+  - index: 2
+    direction: rear_left
+    device:    /dev/maixsense_tof_2
+    frame:     tof_2_link
+  - index: 3
+    direction: rear_right
+    device:    /dev/maixsense_tof_3
+    frame:     tof_3_link
+  - index: 4
+    direction: front_right
+    device:    /dev/maixsense_tof_4
+    frame:     tof_4_link
+
+# NB: maixsense_tof_array.launch.py currently uses these defaults baked in.
+# This file documents the mapping for operators and serves as the source for a
+# future parameterized launch where device paths come from YAML.

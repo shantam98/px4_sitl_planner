@@ -1,0 +1,46 @@
+# Hardware static TF offsets — consumed by tf_static_broadcaster.
+#
+# v1: mirrors the simulation SDF poses. Update these once the real airframe is
+# measured / sensor mounts are finalized.
+
+hardware_tf_static_broadcaster:
+  ros__parameters:
+    # ── Map -> odom ──────────────────────────────────────────
+    # Static identity placeholder. Once cuVSLAM is online on hardware,
+    # set publish_map_to_odom=false so cuVSLAM owns this edge.
+    publish_map_to_odom: true
+
+    # ── Sensor mount poses (base_link frame, ENU) ────────────
+    # Positions in metres, orientations as roll/pitch/yaw (radians).
+
+    # RealSense D415 — forward, slightly above base
+    rgbd_cam_link.x:   0.20
+    rgbd_cam_link.y:   0.00
+    rgbd_cam_link.z:   0.02
+    rgbd_cam_link.yaw: 0.0
+
+    # Stereo IR pair (D415 builds these from intrinsics; we still need a
+    # base_link -> d415_link static if the realsense package doesn't broadcast)
+    # NB: realsense_description handles d415_link -> *_optical_frame internally.
+    d415_link.x:   0.20
+    d415_link.y:   0.00
+    d415_link.z:   0.02
+    d415_link.yaw: 0.0
+
+    # MaixSense ToF ring (5 sensors on a shared tof_array_link)
+    tof_array_link.x:   0.00
+    tof_array_link.y:   0.00
+    tof_array_link.z:   0.00
+    tof_array_link.yaw: 0.0
+
+    # Per-sensor yaw within the array (matches SDF):
+    tof_0_link.yaw:  0.0           # front
+    tof_1_link.yaw:  1.2566        # +72 deg = front-left
+    tof_2_link.yaw:  2.5133        # +144 deg = rear-left
+    tof_3_link.yaw: -2.5133        # -144 deg = rear-right
+    tof_4_link.yaw: -1.2566        # -72 deg = front-right
+
+# NB: tf_static_broadcaster reads the param names it already knows from
+# cloud_merge/src/tf_static_broadcaster.cpp. If this YAML uses keys that node
+# doesn't declare, they are silently ignored. Cross-check that cpp file when
+# adjusting names.

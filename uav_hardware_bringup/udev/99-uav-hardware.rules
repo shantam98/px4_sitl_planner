@@ -1,0 +1,54 @@
+# udev rules for UAV hardware — stable device naming.
+#
+# Install with:
+#   sudo cp 99-uav-hardware.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger
+#   (unplug + replug each device)
+#
+# Then verify with:
+#   ls -la /dev/maixsense_tof_* /dev/pixhawk
+#
+# ─── MaixSense MS-A010 ToF sensors ────────────────────────────────────────────
+#
+# Each MaixSense uses a CH340 USB-serial chip (vendor 1a86, product 7523).
+# To distinguish 5 identical devices, we match on ATTRS{serial} (unique per
+# unit). Run scripts/discover_maixsense.sh after plugging each sensor in turn
+# to capture its serial, then paste the serial into the corresponding line
+# below.
+#
+# CRITICAL: serials below are PLACEHOLDERS. Replace them before reloading udev.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="REPLACE_WITH_SERIAL_FRONT",       SYMLINK+="maixsense_tof_0"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="REPLACE_WITH_SERIAL_FRONT_LEFT",  SYMLINK+="maixsense_tof_1"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="REPLACE_WITH_SERIAL_REAR_LEFT",   SYMLINK+="maixsense_tof_2"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="REPLACE_WITH_SERIAL_REAR_RIGHT",  SYMLINK+="maixsense_tof_3"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="REPLACE_WITH_SERIAL_FRONT_RIGHT", SYMLINK+="maixsense_tof_4"
+
+# ─── Pixhawk FMU-V3 (USB-C) ───────────────────────────────────────────────────
+#
+# Pixhawk presents as a CDC ACM device (VID 26ac PID 0011 for the v3 flight
+# board, or 3185 0038 for some FMU variants). Both rules below are present so
+# either matches. Symlink /dev/pixhawk for pixhawk_serial.launch.py.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="26ac", SYMLINK+="pixhawk"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="3185", SYMLINK+="pixhawk"
+
+# ─── Notes ────────────────────────────────────────────────────────────────────
+# * The CH340 chip vendor/product (1a86:7523) is shared across many cheap
+#   USB-serial adapters — without the serial-number match, your wireless
+#   keyboard dongle could grab the symlink. Always include ATTRS{serial}.
+# * If your MaixSense devices report serial="" (empty), the firmware doesn't
+#   expose one. Fall back to USB port-path matching:
+#       KERNELS=="1-1.4.2:1.0", SYMLINK+="maixsense_tof_0"
+#   This anchors to a physical USB hub slot — stable across reboots only if
+#   the cabling never changes.

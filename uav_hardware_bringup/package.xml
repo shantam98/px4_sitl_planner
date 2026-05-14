@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>uav_hardware_bringup</name>
+  <version>0.0.1</version>
+  <description>
+    Launch + driver orchestration for the real UAV hardware: Intel RealSense D415,
+    5x MaixSense (Sipeed MS-A010) ToF cameras over USB, and PX4 (Pixhawk FMU-V3)
+    via MicroXRCE-DDS over USB serial. Publishes topics matching the simulation
+    contract (/drone/stereo/*, /drone/rgbd/*, /drone/tof_N/*, /fmu/*) so the
+    existing planner_ws stack works unchanged on real hardware.
+  </description>
+  <maintainer email="shantam.sharma98@gmail.com">shantam</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <!-- exec_depends: required at runtime, expected to be apt-installable
+       on the target machine (laptop or Orin Nano with JetPack ROS) -->
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- NB: sipeed_tof_ms_a010 lives in a separate workspace (maixsense_ws)
+       and is sourced before this package at launch time. Not declared here
+       to avoid build-time rosdep resolution that would fail on a fresh checkout. -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
