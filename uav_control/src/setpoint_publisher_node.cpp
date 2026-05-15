@@ -10,7 +10,7 @@
 //   /uav/mission_complete      (std_msgs/Bool)
 //   /fmu/out/vehicle_odometry  (px4_msgs/VehicleOdometry)
 //   /fmu/out/vehicle_status_v2 (px4_msgs/VehicleStatus)
-//   /fmu/out/vehicle_local_position_v1 (px4_msgs/VehicleLocalPosition)
+//   /fmu/out/vehicle_local_position_v2 (px4_msgs/VehicleLocalPosition)
 //
 // Publishes:
 //   /fmu/in/offboard_control_mode  (px4_msgs/OffboardControlMode)
@@ -90,7 +90,7 @@ public:
 
     // Local position for takeoff detection
     pos_sub_ = create_subscription<px4_msgs::msg::VehicleLocalPosition>(
-        "/fmu/out/vehicle_local_position_v1", px4_qos,
+        "/fmu/out/vehicle_local_position_v2", px4_qos,
         [this](const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg) {
           local_z_ = msg->z;  // NED: negative when airborne
         });
