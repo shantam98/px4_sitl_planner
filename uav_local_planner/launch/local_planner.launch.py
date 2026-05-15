@@ -30,6 +30,7 @@ def generate_launch_description():
                 'final_acceptance_radius': 0.25,
                 'replan_deviation':        2.0,
                 'publish_rate_hz':         20.0,
+                'use_sim_time':            True,
             }],
         ),
 
@@ -41,7 +42,7 @@ def generate_launch_description():
             executable='mp_node',
             name='mp_node',
             output='screen',
-            parameters=[mp_config],
+            parameters=[mp_config, {'use_sim_time': True}],
         ),
 
         # ── Legacy VFH3D (OctoMap-based) — launch with use_mp:=false ──────
@@ -67,6 +68,7 @@ def generate_launch_description():
                 'max_vz':         1.0,
                 'min_clearance':  0.6,
                 'update_rate_hz': 20.0,
+                'use_sim_time':   True,
             }],
         ),
     ])

@@ -13,6 +13,7 @@ def generate_launch_description():
                 'yaw_speed':             0.5,
                 'hover_on_complete':     True,
                 'vehicle_status_topic':  '/fmu/out/vehicle_status_v2',
+                'use_sim_time':          True,
             }],
         ),
     ])

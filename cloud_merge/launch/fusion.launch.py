@@ -17,11 +17,13 @@ def generate_launch_description():
             description='Publish static identity map→odom. Set false when cuVSLAM owns this edge.'),
 
         # 1. Static TF broadcaster — sensor frames relative to base_link
+        #    use_sim_time so static TF stamps match cuVSLAM's Gazebo /clock view.
         Node(
             package='uav_depth_fusion',
             executable='tf_static_broadcaster',
             name='tf_static_broadcaster',
             output='screen',
+            parameters=[{'use_sim_time': True}],
         ),
 
         # 2. PX4 odometry bridge — publishes odom→base_link TF + /drone/odom
@@ -39,6 +41,7 @@ def generate_launch_description():
                 'publish_map_to_odom': ParameterValue(
                     LaunchConfiguration('publish_map_to_odom'),
                     value_type=bool),
+                'use_sim_time': True,
             }],
         ),
 
@@ -51,6 +54,7 @@ def generate_launch_description():
             parameters=[{
                 'target_frame':    LaunchConfiguration('target_frame'),
                 'tf_timeout_sec':  LaunchConfiguration('tf_timeout_sec'),
+                'use_sim_time':    True,
             }],
         ),
 
@@ -62,5 +66,6 @@ def generate_launch_description():
             executable='stereo_camera_info_publisher',
             name='stereo_camera_info_publisher',
             output='screen',
+            parameters=[{'use_sim_time': True}],
         ),
     ])
