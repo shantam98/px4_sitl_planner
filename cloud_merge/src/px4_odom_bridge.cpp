@@ -26,13 +26,21 @@ public:
     tf_br_     = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     tf_static_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
 
-    // Static map → odom (identity; replace with SLAM/VIO output later)
-    geometry_msgs::msg::TransformStamped map_odom;
-    map_odom.header.stamp    = get_clock()->now();
-    map_odom.header.frame_id = "map";
-    map_odom.child_frame_id  = "odom";
-    map_odom.transform.rotation.w = 1.0;
-    tf_static_->sendTransform(map_odom);
+    // When cuVSLAM is running it owns this edge dynamically — set false to avoid
+    // duplicate publishers (TF_OLD_DATA warnings, nondeterministic lookups).
+    const bool publish_map_to_odom = declare_parameter("publish_map_to_odom", true);
+
+    if (publish_map_to_odom) {
+      geometry_msgs::msg::TransformStamped map_odom;
+      map_odom.header.stamp    = get_clock()->now();
+      map_odom.header.frame_id = "map";
+      map_odom.child_frame_id  = "odom";
+      map_odom.transform.rotation.w = 1.0;
+      tf_static_->sendTransform(map_odom);
+      RCLCPP_INFO(get_logger(), "Publishing static identity map→odom");
+    } else {
+      RCLCPP_INFO(get_logger(), "Static map→odom gated off (cuVSLAM owns this edge)");
+    }
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/odom", 10);
 

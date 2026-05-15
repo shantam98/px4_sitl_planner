@@ -11,6 +11,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('target_frame', default_value='base_link'),
         DeclareLaunchArgument('tf_timeout_sec', default_value='0.1'),
+        DeclareLaunchArgument(
+            'publish_map_to_odom', default_value='true',
+            description='Publish static identity map→odom. Set false when cuVSLAM owns this edge.'),
 
         # 1. Static TF broadcaster — sensor frames relative to base_link
         Node(
@@ -21,11 +24,15 @@ def generate_launch_description():
         ),
 
         # 2. PX4 odometry bridge — publishes odom→base_link TF + /drone/odom
+        #    Also owns the static map→odom edge unless gated off (cuVSLAM mode).
         Node(
             package='uav_depth_fusion',
             executable='px4_odom_bridge',
             name='px4_odom_bridge',
             output='screen',
+            parameters=[{
+                'publish_map_to_odom': LaunchConfiguration('publish_map_to_odom'),
+            }],
         ),
 
         # 3. Point cloud merge — fuses 5x ToF into /drone/tof_merged/points

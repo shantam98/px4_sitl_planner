@@ -1,0 +1,151 @@
+digraph G {
+    rankdir=LR;
+    splines=polyline;
+    nodesep=0.5;
+    ranksep=1.2;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=8];
+
+    subgraph cluster_SEN {
+        label="📷 Sensors";
+        style=filled;
+        fillcolor="#e8f5e9";
+        color="#4caf50";
+        fontsize=11;
+        D415 [label="RealSense D415\nstereo IR + RGBD", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        TOFx5 [label="MaixSense ToF ×5\n(ring)", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        BTM [label="Bottom depth", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_PER {
+        label="Perception";
+        style=filled;
+        fillcolor="#e3f2fd";
+        color="#42a5f5";
+        fontsize=11;
+        CM [label="Cloud Merge\n/drone/tof_merged", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        POB [label="PX4 Odom Bridge\nNED → ENU", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        TFB [label="TF Static\nBroadcaster", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        SCIP [label="Stereo CamInfo Pub\n(sim only)", shape=box, style="filled,rounded", fillcolor="#b0bec5", fontcolor=black, fontname="Helvetica Italic"];
+        CV [label="cuVSLAM\nmap → odom TF", shape=box, style="filled,rounded", fillcolor="#ef5350", fontcolor=white, fontname="Helvetica Bold"];
+        NV [label="nvblox\nTSDF / ESDF", shape=box, style="filled,rounded", fillcolor="#ef5350", fontcolor=white, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_REF {
+        label="Reflection / Semantic";
+        style=filled;
+        fillcolor="#fff3e0";
+        color="#ff9800";
+        fontsize=11;
+        VLM [label="VLM Inference\nAPI or NanoOWL", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+        SGC [label="Semantic Graph\nCombiner", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+        SDB [label="Semantic Pose\nGraph DB", shape=box, style="filled,rounded", fillcolor="#ef5350", fontcolor=white, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_GOAL {
+        label="Goal Management";
+        style=filled;
+        fillcolor="#fce4ec";
+        color="#e91e63";
+        fontsize=11;
+        UII [label="User Instruction\nInterface", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+        VSG [label="VLM Spatial\nGrounding", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+        SPFO [label="SPF Orchestrator\n= Global Planner", shape=box, style="filled,rounded", fillcolor="#ef5350", fontcolor=white, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_PLAN {
+        label="Planning";
+        style=filled;
+        fillcolor="#e8eaf6";
+        color="#3f51b5";
+        fontsize=11;
+        WPM [label="Waypoint Manager\nrotate-then-translate FSM", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+        MP [label="Dynamic Planner\nmp_node", shape=box, style="filled,rounded", fillcolor="#42a5f5", fontcolor=white, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_SAF {
+        label="Safety";
+        style=filled;
+        fillcolor="#fce4ec";
+        color="#f44336";
+        fontsize=11;
+        MUX [label="cmd_vel Mux", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+        WD [label="VSLAM Watchdog", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+        HSA [label="Health Adapters\nbattery / RC / sensor", shape=box, style="filled,rounded", fillcolor="#fff176", fontcolor=black, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_LND {
+        label="Emergency Landing";
+        style=filled;
+        fillcolor="#fff8e1";
+        color="#ffc107";
+        fontsize=11;
+        EL [label="Emergency Landing\nFSM", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+        POB2 [label="Pixhawk Offboard\nBridge", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+    }
+
+    subgraph cluster_CTRL {
+        label="Flight Control";
+        style=filled;
+        fillcolor="#eceff1";
+        color="#78909c";
+        fontsize=11;
+        SP [label="Setpoint Publisher\nlifecycle FSM", shape=box, style="filled,rounded", fillcolor="#ffb74d", fontcolor=black, fontname="Helvetica Bold"];
+        DDS [label="MicroXRCE-DDS\nAgent", shape=box, style="filled,rounded", fillcolor="#4caf50", fontcolor=white, fontname="Helvetica Bold"];
+        PX4 [label="PX4 Firmware\n+ Pixhawk IMU/GPS", shape=box, style="filled,rounded", fillcolor="#fafafa", fontcolor=black];
+    }
+
+    MOT [label="⚙ Motors", shape=ellipse, style=filled, fillcolor="#fafafa", fontcolor=black];
+
+    // Sensor inputs
+    D415 -> CM;
+    TOFx5 -> CM;
+    BTM -> CM;
+    D415 -> CV;
+    SCIP -> CV [style=dotted, label="sim only"];
+
+    // Perception flow
+    CM -> NV;
+    CV -> NV;
+    DDS -> POB [label="/fmu/out/odom"];
+    POB -> CV;
+
+    // Semantic
+    D415 -> VLM;
+    VLM -> SGC;
+    SGC -> SDB;
+
+    // Goal management
+    UII -> VSG;
+    D415 -> VSG;
+    VSG -> SPFO [label="/spf/target_pose"];
+
+    // Planning
+    SPFO -> WPM [label="action"];
+    WPM -> MP [label="/uav/current_waypoint\n+ mission_phase"];
+    NV -> MP [style=dotted, label="ESDF"];
+
+    // Safety
+    CV -> WD [label="visual_slam/status"];
+    WD -> SPFO [label="emergency_trigger"];
+    WD -> EL [label="emergency_trigger"];
+    DDS -> HSA [label="/fmu/out/battery_status"];
+    HSA -> EL;
+
+    // Cmd-vel path
+    MP -> MUX [label="/uav/cmd_vel"];
+    EL -> MUX [label="/landing/cmd_vel\n(Twist)"];
+    EL -> MUX [label="/landing/enable", style=dotted];
+    MUX -> SP [label="/uav/cmd_vel_safe\n(TwistStamped)"];
+    WPM -> SP [style=dotted, label="mission_phase +\ncurrent_waypoint"];
+
+    // Landing direct bypass
+    EL -> POB2;
+    POB2 -> DDS;
+
+    // Flight control output
+    SP -> DDS [label="/fmu/in/trajectory_setpoint"];
+    DDS -> PX4;
+    PX4 -> MOT;
+}
