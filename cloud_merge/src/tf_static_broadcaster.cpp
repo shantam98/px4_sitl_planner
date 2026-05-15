@@ -82,6 +82,17 @@ public:
     // SDF pose: <pose>0 0 -0.05 0 1.5708 0</pose>  (pitched 90° down)
     tfs.push_back(make_tf("base_link", "bottom_cam_link", 0.0, 0.0, -0.05, 0, M_PI_2, 0, t));
 
+    // ── base_link → stereo_{left,right}_cam_link ─────────────────────
+    // 55 mm baseline matches the D415 stereo IR pair. SDF poses:
+    //   left  <pose>0.2  0.0275 0.02 0 0 0</pose>
+    //   right <pose>0.2 -0.0275 0.02 0 0 0</pose>
+    // Both fixed-jointed to base_link. cuVSLAM looks these up via
+    // canTransform; without them the visual_slam_node stays in INIT.
+    tfs.push_back(make_tf("base_link", "stereo_left_cam_link",
+                           0.2,  0.0275, 0.02, 0, 0, 0, t));
+    tfs.push_back(make_tf("base_link", "stereo_right_cam_link",
+                           0.2, -0.0275, 0.02, 0, 0, 0, t));
+
     broadcaster_->sendTransform(tfs);
     RCLCPP_INFO(get_logger(), "Published %zu static transforms", tfs.size());
   }

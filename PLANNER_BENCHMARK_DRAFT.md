@@ -1,148 +1,130 @@
-# Plan — Motion Planner Benchmark: MP vs MIGHTY vs EGO-Planner-v2
+# Plan — Motion Planner Benchmark: MP vs MP+ESDF (vs VFH3D+/ESDF, optional)
 
 ## Context
 
-The current local planner (`mp_node` in `uav_local_planner`) is a custom 20 Hz motion-primitive avoidance loop validated on the f450 + ToF array. The mid-term report commits to a "Dynamic Planner running at 50-60 Hz" for the inspection-by-drone use case — a target our current MP doesn't hit, and which would ideally be informed by SoTA literature rather than tuned in-house.
+The current local planner (`mp_node` in `uav_local_planner`) is a custom 20 Hz motion-primitive avoidance loop that operates on a short raw-cloud history (no persistent map). The mid-term report commits to a "Dynamic Planner running at 50–60 Hz" for the inspection-by-drone use case — a target that today's MP doesn't comfortably hit, in part because per-cycle obstacle checks iterate a ~15k-point kdtree.
 
-This plan benchmarks three planners against each other in simulation, with the goal of either:
-- Validating that our `mp_node` is good enough for the use case, or
-- Picking a SoTA successor to integrate into the production stack.
+This plan answers a focused question:
 
-**No code in `mp_node.cpp` changes.** It is the baseline. MIGHTY (MIT-ACL, Hermite-spline trajectory opt, ROS 2 native) and EGO-Planner-v2 (ZJU FAST Lab, gradient-based B-spline traj opt, official ROS 2 port at `ego-planner-swarm/ros2_version`) are added as alternative *backends* behind a launch-arg switch.
+> **Does a persistent voxel map (nvblox ESDF) materially improve a primitive-scoring reactive planner — in avoidance quality and/or compute cost — versus the mapless raw-cloud-history approach we have today?**
+
+If yes → MP migrates to ESDF as a production upgrade; the work is reusable. If no → MP's mapless architecture is validated, and we stop chasing the map for this class of planner.
+
+This intentionally **skips third-party planners** (MIGHTY, EGO-Planner-v2, DWA-3D). The earlier MIGHTY/EGO route was abandoned because (a) dependency surface is large (Livox-SDK, custom Gazebo plugins, GPL caveats), and (b) the SoTA question is premature — first we should know whether the *map itself* matters for a reactive planner of our class. If the answer is "yes," then SoTA-trajectory-optimization comparators become a worthwhile follow-up; if "no," they aren't.
 
 User decisions baked into this plan:
-- **Depth input**: D415-only (`/drone/rgbd/points` with voxel downsample to 0.05 m). Accepting the ~65° forward FOV limitation as a constant across all three planners.
-- **Output contract**: `geometry_msgs/TwistStamped` on `/uav/cmd_vel` for all three. Existing `setpoint_publisher_node` (uav_control) is the unchanged controller. Adapters convert MIGHTY/EGO native outputs to TwistStamped.
+- **Sensor input**: D415 only (`/drone/rgbd/points`). 5 ToFs stay running in sim but unused by the planners under test.
+- **Map source**: nvblox ESDF, owned by the `vslam.launch.py` stack (Phase 2 work). OctoMap is **out** — we don't want it.
+- **Output contract**: `geometry_msgs/TwistStamped` on `/uav/cmd_vel`. Existing `setpoint_publisher_node` unchanged. Both configs share the same controller.
 - **Target**: Sim only for v1 (Gazebo `indoor_obstacle` on the cluster). Hardware validation deferred until a winner is chosen.
+- **Memory cap mechanism**: use nvblox's `clear_outside_radius_m` (drops voxel blocks beyond X m of the drone) rather than `max_integration_distance_m` (which only limits *new* observations, not existing voxels).
+- **Scenario sizing constraint**: cul-de-sac depth in `dead_end_recovery.yaml` must be strictly less than `clear_outside_radius_m` so the back wall stays in ESDF memory while the drone retreats. `long_traverse.yaml` is forward-only — no memory recall required — so it isn't bounded by this constraint.
 
 ---
 
 ## Scope
 
-| Planner | Source | ROS distro | Output contract used | Effort |
-|---|---|---|---|---|
-| **mp_node** (baseline) | `planner_ws/uav_local_planner/src/mp_node.cpp` (existing) | ROS 2 Humble | Native TwistStamped on `/uav/cmd_vel` | 0 (baseline) |
-| **MIGHTY** | `mit-acl/mighty` | ROS 2 Humble | Hermite-spline setpoints → adapter → TwistStamped | ~3-4 days |
-| **EGO-Planner-v2** | `ZJU-FAST-Lab/ego-planner-swarm` branch `ros2_version` | ROS 2 Humble | `quadrotor_msgs/PositionCommand` → adapter → TwistStamped | ~3-4 days |
+| Config | Planner | Obstacle source | New work |
+|---|---|---|---|
+| **A — MP baseline (mapless)** | `mp_node` (unchanged) | Raw cloud history (today's behaviour) | None |
+| **B — MP + ESDF** | `mp_node` (patched) | nvblox `static_esdf_pointcloud` | New ESDF subscriber; replace `pointToArcDist2D` inner loop with `esdf.lookup()` |
+| **C — VFH3D+ + ESDF** (optional, gated) | `vfh3d_node` (patched) | nvblox `static_esdf_pointcloud` | Swap OctoMap subscription for ESDF; adapt histogram-build inner loop |
 
-Plus shared work:
-- D415-only sim subscription wiring: ~0.5 day (just topic remaps + one YAML edit)
-- Comparison harness (scenarios, automation, metrics, report): ~2-3 days
-- Run + analyze: ~1-2 days
+**Total minimum scope: A + B + harness.** Adding C costs ~+2 days and is contingent on A vs B being inconclusive (or the team wanting a stronger story).
 
-**Total: ~10-14 engineering days.** With one person, plan ~3 weeks calendar time.
+### Why this design
 
-### Why no external voxel filter
-
-Originally I had a `pcl::VoxelGrid` step downsampling D415's 920K points before feeding the planners. Dropped after closer look:
-
-- **EGO-Planner-v2** maintains its own internal `grid_map` module — subscribes to raw point cloud and builds an occupancy voxel grid at its own resolution. Trajectory optimizer queries the grid, not the cloud. EGO handles density internally.
-- **MIGHTY** uses an internal ESDF representation similarly.
-- **MP** is the only planner without internal voxelization. It iterates `O(points × primitives)` on the raw cloud. But MP already has a `history_subsample` parameter (default 2). For D415's higher point count, bump to 8 (keep 1-in-8) → ~115K usable points × 90 primitives × 20 Hz = ~200M ops/sec, well within Orin Nano budget.
-
-Net: each planner manages cloud density its own way; no shared filter node needed. Cleaner comparison, less infrastructure.
+- **Single-variable A/B** (with/without persistent map) — controls for everything else (planner algorithm, sensor input, controller, scoring weights). Results are directly attributable to the map.
+- **Zero external dependencies** — both configs are already in our workspace; only thing new is the nvblox subscription, and nvblox is already wired in Phase 2.
+- **Production-aligned** — whichever config wins is immediately shippable; no second integration sweep.
 
 ---
 
 ## Work breakdown
 
-### Phase A — D415-only sim wiring (0.5 day)
+### Phase A — Confirm nvblox ESDF is queryable (0.5 day)
 
-Goal: All three planners subscribe to D415's raw point cloud. Each planner manages density internally.
+Goal: verify Phase 2 actually produces a usable ESDF stream from our sim cloud, and pick the exact topic the planners will subscribe to.
 
-1. **All three planners subscribe to `/drone/rgbd/points`** (the existing topic from `realsense2_camera` / Gazebo bridge).
-2. **MP node config bump**: edit `planner_ws/uav_local_planner/config/mp_params.yaml`:
-   - `history_subsample: 2 → 8` (keeps ~115K of ~920K D415 points per cycle — comfortable for 20 Hz on Orin)
-   - Optionally: also bump if running at higher rate
-3. **5 ToFs stay running** in sim (no SDF edits). They just aren't consumed by the planners under test. Keeps the rest of the stack (visualization, octomap) unaffected during benchmark.
+1. Run `run_sitl_slam.sh` Variant 2 (cuVSLAM + nvblox).
+2. Confirm `nvblox_node/static_esdf_pointcloud` is at ≥5 Hz with reasonable point counts.
+3. Decide between subscription forms (in priority order):
+   - **`static_esdf_pointcloud`** (`PointCloud2` with distance in intensity field) — easiest, lowest coupling.
+   - **`esdf_layer`** direct subscription via nvblox C++ API — fastest, but couples to nvblox internals.
+   - **Service-based lookup** — out of scope for v1.
+4. Document the chosen topic + frame + QoS in `vslam.yaml` config comments.
 
-Critical files:
-- `planner_ws/uav_local_planner/config/mp_params.yaml` — single line edit (`history_subsample`)
-- `planner_ws/uav_local_planner/src/mp_node.cpp` — confirm cloud subscription topic is parameterized (line ~218 per exploration). If hardcoded to `/drone/tof_merged/points`, change to a launch arg with default `/drone/rgbd/points` for D415-only mode.
-- No new nodes, no new packages.
+Output: one paragraph in this doc updating §"Decisions" with the actual topic name.
 
-### Phase B — MIGHTY integration (3-4 days)
+### Phase B — MP + ESDF integration (1.5–2 days)
 
-Workspace layout:
+Files modified:
+- `uav_local_planner/include/uav_local_planner/motion_primitives.hpp`
+- `uav_local_planner/src/motion_primitives.cpp`
+- `uav_local_planner/src/mp_node.cpp`
+- `uav_local_planner/config/mp_params.yaml`
+
+**B.1 — Add ESDF subscriber (~30 min)**
+In `mp_node.cpp`, add a subscription to `nvblox_node/static_esdf_pointcloud`. Maintain a member voxel hash (key: voxel index, value: signed distance). Update on each callback. Keep raw-cloud subscription too — controlled by config flag `use_esdf: {true,false}`.
+
+**B.2 — ESDF voxel lookup helper (~1 hour)**
+New method in `MotionPrimitives`: `double esdfLookup(const Eigen::Vector3f& p) const` — quantizes `p` to a voxel key, returns the stored distance (or `+inf` if no voxel). Voxel size matches nvblox config (default 0.05 m).
+
+**B.3 — Replace inner loop (~3 hours)**
+In `motion_primitives.cpp`'s scoring loop, today:
+```cpp
+for each primitive:
+  for each point in point_buf_:
+    d = pointToArcDist2D(point, arc); ...
 ```
-~/irobot/mighty_ws/src/mighty               ← external clone (BSD-3)
-~/irobot/mighty_ws/src/uav_mighty_adapter   ← NEW, our shim package
+Change to:
+```cpp
+for each primitive:
+  for sample along arc (~20 samples evenly spaced):
+    d = esdfLookup(sample);
+    if d < collision_radius: collision = true; closest_d = min(closest_d, d);
 ```
+- 20 samples per arc × 90 arcs = 1800 lookups per cycle (down from ~1.4M cloud-distance computations).
+- Use config flag `use_esdf` to switch between today's path and the new one in the same binary — required for the A/B benchmark to share one build.
 
-**B.1 — External dependencies (0.5 day)**
-MIGHTY needs:
-- DecompROS2 (clone, build): `git clone https://github.com/sikang/DecompROS2.git`
-- L-BFGS solver: header-only, vendor into the workspace or apt
-- Livox-SDK2 / livox_ros_driver2: **not needed for us** — we feed standard `sensor_msgs/PointCloud2` directly. Verify their planner subscribes to a generic topic name; if Livox-coupled, write an adapter cloud node.
+**B.4 — Gradient-aware cost (optional, +0.5 day)**
+nvblox publishes per-voxel ESDF; gradient can be computed via finite differences across 6 neighbours. Add a penalty proportional to `−∇d · arc_heading` (primitives heading *toward* the nearest obstacle cost more than primitives heading *past* it). Skip for v1 if Phase B fits the day budget; add as Phase B.5 if there's headroom.
 
-**B.2 — Input adapter (0.5 day)**
-- Remap MIGHTY's expected input topic to `/drone/depth/points_voxel` and `/drone/odom`.
-- If MIGHTY assumes a body-fixed point cloud and we ship a `rgbd_cam_link`-frame cloud, add a TF transform in the adapter (probably already handled if their planner uses TF).
+**B.5 — Diagnostic topic**
+Extend `/uav/mp_diag` with ESDF-mode flag and a per-cycle ESDF voxel count. Lets the analysis script confirm config B actually used the ESDF when expected.
 
-**B.3 — Output adapter (1 day)**
-- New node `uav_mighty_adapter/src/mighty_to_cmdvel.cpp`.
-- Subscribes to MIGHTY's setpoint output (likely a setpoint stream with position/velocity/acceleration).
-- Extracts the velocity component, converts frame if needed (map ENU is what `/uav/cmd_vel` consumers expect).
-- Publishes `geometry_msgs/TwistStamped` on `/uav/cmd_vel`.
-- Throttle to 50 Hz if MIGHTY publishes faster.
+### Phase C — VFH3D+ + ESDF integration (1.5–2 days, OPTIONAL)
 
-**B.4 — Launch wiring (0.5 day)**
-- New `uav_mighty_adapter/launch/mighty_planner.launch.py`.
-- Includes MIGHTY's stock launch, our adapter, and a static TF if needed.
-- Surfaced from `local_planner.launch.py` via `planner_backend:=mighty`.
+Files modified:
+- `uav_local_planner/include/uav_local_planner/vfh3d.hpp`
+- `uav_local_planner/src/vfh3d.cpp`
+- `uav_local_planner/src/vfh3d_node.cpp`
+- `uav_local_planner/CMakeLists.txt` (drop `octomap` link if no longer needed)
+- `uav_local_planner/package.xml` (drop `octomap_msgs`, `octomap`)
 
-**B.5 — Sim test + debug (1-1.5 days)**
-- Run `mighty_planner.launch.py` with `setpoint_publisher_node` + Gazebo.
-- Confirm waypoint missions complete.
-- Tune any MIGHTY-specific parameters (look-ahead distance, smoothness weight).
+**C.1 — Replace OctoMap subscription**
+- `vfh3d_node.cpp:51` swaps `octomap_msgs::msg::Octomap` subscription on `/octomap_binary` for `sensor_msgs::msg::PointCloud2` on `nvblox_node/static_esdf_pointcloud`.
+- Today the callback hydrates an `octomap::OcTree*`; new callback fills a `pcl::PointCloud<pcl::PointXYZI>` (intensity = signed distance).
 
-### Phase C — EGO-Planner-v2 ROS 2 integration (3-4 days)
+**C.2 — Replace histogram build**
+- `vfh3d.cpp:38` and `:116`: instead of `octree.search(query)` returning an `OcTreeNode*` with binary occupancy, the inner loop iterates ESDF points within the bbox and bins them into the polar histogram. Bins record the *minimum* distance in their cone — that's the natural fit for ESDF data.
+- The "occupied" threshold becomes `distance < collision_radius`.
 
-Workspace layout:
-```
-~/irobot/ego_planner_ws/src/ego-planner-swarm    ← clone, branch ros2_version (GPL-3)
-~/irobot/ego_planner_ws/src/uav_ego_adapter      ← NEW, our shim package
-```
+**C.3 — Strip OctoMap deps**
+- Confirm no other planner_ws consumer needs OctoMap. (Already discussed in `SYSTEM_ARCHITECTURE.md` §4 — `uav_planner_interface` is the only other potential consumer; we'd handle that in Phase 3 of the master VSLAM plan.)
+- Drop `octomap`/`octomap_msgs` from `CMakeLists.txt` and `package.xml` of `uav_local_planner`.
 
-GPL-3.0 license: be aware that anything *statically linked* to EGO becomes GPL. Our adapter and `setpoint_publisher_node` only consume EGO output via topics — that's not derivative work, MIT/proprietary code can interop. Just don't include EGO source in any proprietary deliverable.
+**C.4 — Gate**
+Run **only after** Phase B has produced results. If A vs B differ by ≥10% on at least one headline metric (success rate or time-to-goal), the question is answered and C is optional. If they're within 5% of each other across scenarios, run C to determine whether the planning *algorithm* matters more than the map.
 
-**C.1 — External dependencies (0.5 day)**
-- `sudo apt install ros-humble-rmw-cyclonedds-cpp libvtk7-dev` (per their README)
-- PCL is already in our `uav_stack.sif`
-- Clone branch: `git clone -b ros2_version https://github.com/ZJU-FAST-Lab/ego-planner-swarm.git`
-- `colcon build --packages-select ego_planner` (build only the planner, skip the simulator helpers)
-
-**C.2 — Input adapter — odometry (~0.1 day)**
-- EGO subscribes to `visual_slam/odom`. Simple topic remap to `/drone/odom`. No format conversion (both `nav_msgs/Odometry`).
-
-**C.3 — Input adapter — point cloud (~0.5 day)**
-- EGO subscribes to `pcl_render_node/cloud` (their sim's cloud output).
-- Remap to `/drone/depth/points_voxel`.
-- Their grid_map module expects clouds in `world` frame; if it doesn't auto-transform from `rgbd_cam_link`, write a small TF-aware republisher.
-
-**C.4 — Output adapter (1 day)**
-- New node `uav_ego_adapter/src/ego_to_cmdvel.cpp`.
-- Subscribes to `drone_0_planning/pos_cmd` (`quadrotor_msgs/PositionCommand`).
-- Extracts the `velocity` field, converts to `geometry_msgs/TwistStamped`, publishes on `/uav/cmd_vel`.
-- Also subscribe to `drone_0_planning/bspline` if we want richer trajectory data for analysis.
-
-**C.5 — Launch wiring (0.5 day)**
-- New `uav_ego_adapter/launch/ego_planner.launch.py`.
-- Includes `ego_planner`'s `single_run_in_sim.launch.py` (minus the simulator parts — we have Gazebo).
-- Surfaced via `planner_backend:=ego`.
-
-**C.6 — Sim test + debug (1-1.5 days)**
-- Run, observe, tune EGO params (`max_vel`, `max_acc`, `safety_margin`).
-- ROS 2 port has 40 commits — budget extra time for missing remaps or stale params.
-
-### Phase D — Comparison harness (2-3 days)
+### Phase D — Benchmark harness (2–3 days)
 
 New package: `planner_ws/uav_benchmark/`
 
 ```
 uav_benchmark/
 ├── package.xml
-├── setup.py                            # Python-only package (ament_python)
+├── setup.py                            # ament_python
 ├── scenarios/
 │   ├── straight_corridor.yaml
 │   ├── two_pillar_slalom.yaml
@@ -150,111 +132,100 @@ uav_benchmark/
 │   ├── dead_end_recovery.yaml
 │   └── long_traverse.yaml
 ├── uav_benchmark/
-│   ├── run_comparison.py               # main automation
-│   ├── analyze_bags.py                 # metrics extractor
-│   └── plot_results.py                 # pandas + matplotlib
-└── reports/                            # output: tables + plots
+│   ├── run_comparison.py
+│   ├── analyze_bags.py
+│   └── plot_results.py
+└── reports/
 ```
 
 **D.1 — Scenario definitions (0.5 day)**
-Each YAML defines: start pose, goal waypoint(s), obstacle layout (re-use `indoor_obstacle.sdf` or add variants), success criterion (reach goal within N seconds), failure mode (crash detected via `obstacle_distance < 0.1`).
+Per YAML: start pose, goal waypoint(s), obstacle layout (re-use `indoor_obstacle.sdf` or variants), success criterion (reach goal within N seconds), failure criterion (`min_obstacle_distance < 0.1` during run = crash).
 
 **D.2 — Automation script (1 day)**
 `run_comparison.py`:
-- Args: `--planner {mp, mighty, ego}`, `--scenario <name>`, `--seed <N>`, `--repeats <N>`
-- For each repeat:
-  1. Start Gazebo with scenario
-  2. Wait for `/fmu/out/vehicle_status_v1` to publish (PX4 ready)
-  3. Start `local_planner.launch.py planner_backend:=<X>`
-  4. Wait for HOVER state
-  5. Send waypoint via `ros2 action send_goal /uav/navigate_to_goal`
-  6. Start `ros2 bag record -o run_<planner>_<scenario>_<seed>` for all relevant topics
-  7. Watch `/uav/mission_complete` or `/uav/vfh_status == ESTOP` or timeout
-  8. Stop bag, tear down, repeat
+- Args: `--config {A,B,C} --scenario <name> --seed <N> --repeats <N>`
+- Per repeat:
+  1. Start Gazebo with scenario world.
+  2. Wait for `/fmu/out/vehicle_status_v2` to publish (PX4 ready).
+  3. Start `run_sitl_slam.sh` Variant N (nvblox required for B and C; not for A).
+  4. Start `local_planner.launch.py use_esdf:=<bool> use_vfh:=<bool>` matching the config.
+  5. Wait for HOVER.
+  6. Send waypoint via `ros2 action send_goal /uav/navigate_to_goal`.
+  7. Start `ros2 bag record -o run_<config>_<scenario>_<seed>` (relevant topics only).
+  8. Watch `/uav/mission_complete` OR ESTOP OR timeout.
+  9. Stop bag, tear down.
 
 **D.3 — Metrics extractor (1 day)**
 `analyze_bags.py`:
-- Iterates a directory of `.db3` rosbags
-- For each: extracts time-to-goal, path length, average velocity, min obstacle distance, jerk RMS, success flag, mean per-cycle compute time (from `/uav/mp_diag` or planner-specific diagnostic topic)
-- Aggregates into a pandas DataFrame, dumps CSV
+- Iterates `.db3` rosbags
+- Per run extracts: time-to-goal, path length, mean velocity, min obstacle distance, jerk RMS, success flag, mean per-cycle compute time from `/uav/mp_diag` (or `vfh3d_diag`).
+- Aggregates into pandas DataFrame, dumps CSV.
 
 **D.4 — Report generator (0.5 day)**
 `plot_results.py`:
-- Per-metric box plots per planner per scenario
-- Summary table: planner × scenario success rate (%), mean ± stddev for each metric
-- Output: PNG plots + Markdown report ready for the team
+- Per-metric box plots per config per scenario.
+- Summary table: config × scenario success rate (%), mean ± stddev for each metric.
+- Markdown report ready for team sharing.
 
-### Phase E — Run benchmark + analyze (1-2 days)
+### Phase E — Run + analyze (1 day)
 
-- 5 scenarios × 3 planners × 20 repeats = **300 sim runs**
-- Each ~45 s mission + ~30 s overhead = ~3.75 hr compute (assuming sequential)
-- Run on cluster (parallelize across nodes if possible to drop to ~1 hr)
-- Analyze → final report → present to team
+- 2 configs × 5 scenarios × 20 repeats = **200 sim runs** (3 configs → 300 if C included).
+- Each ~45 s mission + ~30 s overhead = ~2.5 hr sequential compute.
+- Run on cluster (parallelize if possible) and analyse.
+
+---
+
+## Effort summary
+
+| Phase | Min scope (A + B) | With C |
+|---|---|---|
+| A | 0.5 day | 0.5 day |
+| B | 2 days | 2 days |
+| C | — | 2 days |
+| D | 2.5 days | 2.5 days |
+| E | 1 day | 1.5 days |
+| **Total** | **~6 days (~1.5 weeks calendar)** | **~8.5 days (~2 weeks calendar)** |
+
+Vs original MIGHTY/EGO scope (10–14 days): **~50–60% reduction**, zero external deps, no license concerns.
 
 ---
 
 ## Critical files
 
-### New external workspaces
-| Path | Origin |
-|---|---|
-| `~/irobot/mighty_ws/src/mighty` | clone `mit-acl/mighty` (BSD-3) |
-| `~/irobot/ego_planner_ws/src/ego-planner-swarm` | clone `ZJU-FAST-Lab/ego-planner-swarm` `ros2_version` (GPL-3) |
-
-### New packages in planner_ws
-| Path | Purpose |
-|---|---|
-| `planner_ws/uav_mighty_adapter/` | MIGHTY setpoint → TwistStamped adapter + launch |
-| `planner_ws/uav_ego_adapter/` | EGO PositionCommand → TwistStamped adapter + launch |
-| `planner_ws/uav_benchmark/` | Comparison harness (Python, ament_python) |
-
-### Modified existing files
 | File | Change |
 |---|---|
-| `planner_ws/uav_local_planner/config/mp_params.yaml` | Bump `history_subsample: 2 → 8` (for D415's higher density) |
-| `planner_ws/uav_local_planner/src/mp_node.cpp` | Parameterize cloud subscription topic (currently hardcoded to `/drone/tof_merged/points` per line ~218); accept `cloud_topic` launch arg |
-| `planner_ws/uav_local_planner/launch/local_planner.launch.py` | Add `planner_backend:={mp,mighty,ego}` launch arg + `cloud_topic` arg (default `/drone/rgbd/points`); conditional include |
+| `uav_local_planner/include/uav_local_planner/motion_primitives.hpp` | Add `esdfLookup()`, voxel hash member, `use_esdf` flag |
+| `uav_local_planner/src/motion_primitives.cpp` | Replace cloud-iteration with ESDF lookup when `use_esdf=true` |
+| `uav_local_planner/src/mp_node.cpp` | Subscribe to `nvblox_node/static_esdf_pointcloud`; pass to `MotionPrimitives` |
+| `uav_local_planner/config/mp_params.yaml` | Add `use_esdf: false` (default) |
+| `uav_local_planner/launch/local_planner.launch.py` | Add `use_esdf` launch arg |
+| `uav_bringup/config/vslam.yaml` | Ensure `nvblox.enable: true` for variant 2 |
+| `PLANNER_BENCHMARK_DRAFT.md` (this file) | Phase A output: confirm topic name |
+| `uav_benchmark/` (new) | Harness, scenarios, analysis |
+
+### Optional (Phase C)
+| File | Change |
+|---|---|
+| `uav_local_planner/include/uav_local_planner/vfh3d.hpp` | Drop `octomap.h`; change query interface to ESDF point cloud |
+| `uav_local_planner/src/vfh3d.cpp` | New histogram-build loop iterating ESDF points |
+| `uav_local_planner/src/vfh3d_node.cpp` | Replace OctoMap subscription with ESDF subscription |
+| `uav_local_planner/CMakeLists.txt` | Drop `octomap` link |
+| `uav_local_planner/package.xml` | Drop `octomap`, `octomap_msgs` |
 
 ### Unchanged
-- `planner_ws/uav_local_planner/src/mp_node.cpp` — baseline, no edits
-- `planner_ws/uav_control/*` — controller stays the same for fair A/B
-- `planner_ws/uav_planner_interface/*` — global planner unaffected
-- PX4-Autopilot, sim world, model SDFs — no changes
-
----
-
-## Reused existing utilities
-
-- **`setpoint_publisher_node`** (`uav_control`) — the shared controller. All three planners' output funnels through this.
-- **`waypoint_manager_node`** (`uav_local_planner`) — provides `/uav/current_waypoint`. Works for all three planners.
-- **`tf_static_broadcaster`** (`uav_depth_fusion`) — TF setup unchanged.
-- **`pcl::VoxelGrid`** (PCL library) — used in voxel filter step; standard apt-shipped library.
-- **`rosbag2`** — for run recording in the comparison harness. Available in `uav_stack.sif`.
+- `mp_node.cpp` algorithm (only subscriber + flag added)
+- `setpoint_publisher_node` — controller stays identical for fair A/B
+- `waypoint_manager_node` — global planner unaffected
+- PX4 firmware, sim worlds (other than scenario variants), SDFs
 
 ---
 
 ## Verification
 
-End-to-end success criteria:
-
-1. **Each planner launches and runs in isolation**
-   - `ros2 launch uav_local_planner local_planner.launch.py planner_backend:=mp` → drone reaches a hand-sent waypoint
-   - Same for `:=mighty` and `:=ego`
-
-2. **Voxel filter sane**
-   - `ros2 topic hz /drone/depth/points_voxel` → ~30 Hz
-   - `ros2 topic echo /drone/depth/points_voxel | grep "data.length"` → reasonable point count (~25-50K)
-
-3. **Comparison harness produces output**
-   - `python3 uav_benchmark/uav_benchmark/run_comparison.py --planner mp --scenario straight_corridor --repeats 3`
-   - Produces 3 bag files
-   - `python3 uav_benchmark/uav_benchmark/analyze_bags.py bags/` → CSV with 3 rows
-   - `python3 uav_benchmark/uav_benchmark/plot_results.py results.csv` → plots in `reports/`
-
-4. **Final benchmark report exists**
-   - 5 scenarios × 3 planners × ≥10 runs each → ≥150 successful bag files
-   - Table with success rate, time-to-goal, path length, min clearance per planner per scenario
-   - Clear winner OR equally clear "MP is good enough" verdict
+1. **Phase A**: `ros2 topic hz /nvblox_node/static_esdf_pointcloud` ≥ 5 Hz; `ros2 topic echo … --once` shows non-zero `data.length`.
+2. **Phase B**: `ros2 launch uav_local_planner local_planner.launch.py use_esdf:=true` runs; `/uav/mp_diag` flags `esdf_mode: true`; drone reaches a hand-sent waypoint.
+3. **Phase D**: `python3 uav_benchmark/run_comparison.py --config B --scenario straight_corridor --repeats 3` produces 3 bag files; `analyze_bags.py bags/` produces a CSV; `plot_results.py` produces plots.
+4. **Final report**: Markdown with success-rate table, time-to-goal box plot, compute-time table for both configs, plain-text verdict.
 
 ---
 
@@ -262,21 +233,19 @@ End-to-end success criteria:
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| MIGHTY's L-BFGS / DecompROS2 deps don't install in `uav_stack.sif` | Medium | Build MIGHTY in its own Singularity image; share data via DDS on the host |
-| EGO's `ros2_version` branch has stale params / undeclared deps | Medium | Budget extra debug time in Phase C.6; community issues on GitHub may help |
-| Adapter latency biases benchmark | Low | Measure adapter overhead separately, subtract from time-to-goal if significant |
-| 20 runs per cell is statistically thin | Medium | If results are close, scale to 50; cluster can absorb the cost |
-| MIGHTY's output format isn't documented | Medium | Reverse-engineer from their example launches and the published RA-L paper |
-| EGO assumes a flat-ground sim and breaks on z-axis missions | Low | Indoor_obstacle world is mostly flat; if it matters, restrict test scenarios to constant altitude |
+| nvblox ESDF rate is too low for 20 Hz MP | Medium | Phase A measures it. If <5 Hz, increase nvblox `voxel_size` or reduce `max_integration_distance_m`. |
+| ESDF voxel size (0.05 m) is too coarse for MP's `collision_radius=0.75 m` margin | Low | 0.05 m << 0.75 m. Plenty of resolution. |
+| ESDF lookup with simple voxel-hash is itself slow | Low | 1800 lookups per cycle is trivial; std::unordered_map suffices. If slow, replace with flat array indexed by voxel key. |
+| Phase B works in sim but ESDF is empty/stale on Orin in flight | Out of scope for v1 | Hardware test deferred. |
+| MP+ESDF achieves identical results to MP-mapless → "nothing to show" | Low (this *is* a real result) | Frame the report around that finding: "raw-cloud history was sufficient." Worth knowing. |
 
 ---
 
 ## Out of scope (deliberately)
 
-- Algorithmic modifications to `mp_node.cpp` — only the cloud-topic param + `history_subsample` tuning. The algorithm itself is the baseline and must not change.
-- D415 + ToF fusion — separately considered, deferred. v1 uses D415-only across all three planners.
-- Mode-switch state machine (commute vs hold) — deferred until comparison picks a winner.
-- Hardware flight tests — sim first, hardware after a winner is chosen.
-- **Feeding nvblox ESDF directly to EGO/MIGHTY** — requires modifying their internal `grid_map`/ESDF subscribers (not just adapter work). Each planner uses its own internal voxelization for v1. Re-evaluate as a follow-up once nvblox is online in `planner_ws` (Phase 3 of master VSLAM plan) — at that point we can swap the *winner's* internal grid for nvblox ESDF queries (free CPU savings, same algorithm).
-- External voxel pre-filter — dropped from the plan. Each planner handles density internally; MP's existing `history_subsample` parameter is sufficient.
-- Fourth planner (Fast-Planner, etc.) — not adding more axes; 3-way is already enough.
+- Algorithmic changes to MP's primitive library, scoring weights, or recovery logic — the algorithm is constant across A and B.
+- Third-party planner integration (MIGHTY, EGO-Planner-v2, DWA-3D). Defer until Phase B results justify it.
+- D415 + ToF fusion — separately considered.
+- Hardware flight tests — sim first.
+- Closing the loop with cuVSLAM pose feedback to PX4 EKF2 — that's Phase H of the master VSLAM plan, not a planner-benchmark concern.
+- Mission_phase guard for SPF compatibility — separate change, applied after benchmark winner is chosen.

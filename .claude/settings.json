@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /home/shantam/irobot/external/ego-planner-swarm/src/ | head -20)",
+      "Read(//home/shantam/irobot/external/ego-planner-swarm/src/**)"
+    ]
+  }
+}
