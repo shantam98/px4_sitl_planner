@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
@@ -31,7 +32,13 @@ def generate_launch_description():
             name='px4_odom_bridge',
             output='screen',
             parameters=[{
-                'publish_map_to_odom': LaunchConfiguration('publish_map_to_odom'),
+                # ParameterValue with value_type=bool forces the LaunchConfiguration
+                # string ("true"/"false") to coerce into a real bool, matching the
+                # C++ declare_parameter type. Without this, Humble throws
+                # ParameterTypeException and kills the node.
+                'publish_map_to_odom': ParameterValue(
+                    LaunchConfiguration('publish_map_to_odom'),
+                    value_type=bool),
             }],
         ),
 
