@@ -11,19 +11,25 @@ vslam:
   enable: true
 
   cuvslam:
-    tracking_mode: 2       # RGBD (matches vslam.yaml master)
-    num_cameras: 1
+    tracking_mode: 0       # stereo only (matches vslam.yaml master)
+    num_cameras: 2
     rectified_images: true
     enable_imu_fusion: false
+    image_jitter_threshold_ms: 33.34
     topics:
-      image_0:       /drone/rgbd/image
-      camera_info_0: /drone/rgbd/camera_info
-      depth_0:       /drone/rgbd/depth
+      image_0:       /drone/stereo/left/image
+      camera_info_0: /drone/stereo/left/camera_info
+      image_1:       /drone/stereo/right/image
+      camera_info_1: /drone/stereo/right/camera_info
       imu:           /drone/imu
+    camera_optical_frames:
+      - stereo_left_cam_optical_frame
+      - stereo_right_cam_optical_frame
     map_frame:       map
     odom_frame:      odom
     base_frame:      base_link
-    rectified_images_frame: rgbd_cam_link
+    publish_map_to_odom_tf: true
+    publish_odom_to_base_tf: false
 
   nvblox:
     enable: false       # ← key difference from vslam.yaml

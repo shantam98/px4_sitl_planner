@@ -511,4 +511,215 @@ double MotionPrimitives::normalizeAngle(double a)
   return a;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ESDF-based scoring (Phase B, additive)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// updateEsdf populates the voxel hash from an nvblox ESDF point cloud.
+// Each point's intensity = signed distance to nearest obstacle (metres).
+// We re-build the hash each call rather than incrementally update so that
+// stale voxels disappear when nvblox stops publishing them.
+void MotionPrimitives::updateEsdf(
+    const pcl::PointCloud<pcl::PointXYZI>& esdf_cloud,
+    double voxel_size)
+{
+  esdf_voxel_size_ = voxel_size > 0.0 ? voxel_size : 0.05;
+  esdf_voxels_.clear();
+  esdf_voxels_.reserve(esdf_cloud.size());
+  const float inv_vs = static_cast<float>(1.0 / esdf_voxel_size_);
+  for (const auto& pt : esdf_cloud.points) {
+    VoxelKey k{
+        static_cast<int>(std::floor(pt.x * inv_vs)),
+        static_cast<int>(std::floor(pt.y * inv_vs)),
+        static_cast<int>(std::floor(pt.z * inv_vs))};
+    esdf_voxels_[k] = pt.intensity;
+  }
+}
+
+double MotionPrimitives::esdfLookup(const Eigen::Vector3f& world_point) const
+{
+  if (esdf_voxels_.empty()) return std::numeric_limits<double>::infinity();
+  const float inv_vs = static_cast<float>(1.0 / esdf_voxel_size_);
+  VoxelKey k{
+      static_cast<int>(std::floor(world_point.x() * inv_vs)),
+      static_cast<int>(std::floor(world_point.y() * inv_vs)),
+      static_cast<int>(std::floor(world_point.z() * inv_vs))};
+  auto it = esdf_voxels_.find(k);
+  if (it == esdf_voxels_.end()) return std::numeric_limits<double>::infinity();
+  return static_cast<double>(it->second);
+}
+
+MPResult MotionPrimitives::updateWithEsdf(
+    const Eigen::Vector3d& drone_pos,
+    double drone_yaw,
+    const Eigen::Vector3d& waypoint)
+{
+  MPResult result;
+  result.estop                 = false;
+  result.obstacle_detected     = false;
+  result.closest_obstacle_dist = std::numeric_limits<double>::max();
+  result.best_primitive_idx    = -1;
+  result.velocity              = Eigen::Vector3d::Zero();
+
+  const double cr = cfg_.collision_radius;
+  const double L  = cfg_.arc_length;
+
+  // Body→world rotation (yaw about Z)
+  const double cy = std::cos(drone_yaw);
+  const double sy = std::sin(drone_yaw);
+
+  // ── 1. ESDF lookup at drone position for closest_obstacle_dist ────────
+  // Sample drone position directly in ESDF.
+  Eigen::Vector3f drone_world(
+      static_cast<float>(drone_pos.x()),
+      static_cast<float>(drone_pos.y()),
+      static_cast<float>(drone_pos.z()));
+  double d_at_drone = esdfLookup(drone_world);
+  if (std::isfinite(d_at_drone)) {
+    result.closest_obstacle_dist = d_at_drone;
+  } else {
+    // No ESDF data near drone — fall back to "lots of clearance"
+    result.closest_obstacle_dist = 100.0;
+  }
+
+  // Pessimistic temporal-min filter (same as cloud path)
+  {
+    recent_obs_dists_[obs_dist_buf_idx_] = result.closest_obstacle_dist;
+    obs_dist_buf_idx_ = (obs_dist_buf_idx_ + 1) % cfg_.pessimistic_window;
+    result.closest_obstacle_dist = *std::min_element(
+        recent_obs_dists_.begin(), recent_obs_dists_.end());
+  }
+
+  // Hysteresis for AVOIDING/NOMINAL state
+  {
+    const bool   raw_det   = result.closest_obstacle_dist < L;
+    const double disengage = L * cfg_.obstacle_hysteresis_factor;
+    result.obstacle_detected = raw_det ||
+        (prev_obstacle_detected_ && result.closest_obstacle_dist < disengage);
+    prev_obstacle_detected_ = result.obstacle_detected;
+  }
+
+  // ── 2. E-stop ─────────────────────────────────────────────────────────
+  if (result.closest_obstacle_dist < cfg_.min_clearance) {
+    result.estop = true;
+    recovery_cycles_remaining_ = cfg_.recovery_duration_cycles;
+    return result;
+  }
+  if (recovery_cycles_remaining_ > 0) --recovery_cycles_remaining_;
+
+  // ── 3. Collision check — sample each primitive against the ESDF ───────
+  // 20 samples per primitive is dense enough for our 2 m arc + 0.05 m
+  // voxel size (sample spacing ≈ 10 cm, comparable to voxel resolution).
+  constexpr int kNumSamples = 20;
+  const int nh = static_cast<int>(horiz_prims_.size());
+  std::vector<bool> valid_h(nh, true);
+
+  for (int i = 0; i < nh; ++i) {
+    const Primitive& p = horiz_prims_[i];
+    for (int s = 1; s <= kNumSamples; ++s) {
+      const double t = static_cast<double>(s) / kNumSamples;
+      Eigen::Vector3d p_body;
+      if (!p.is_curved) {
+        p_body = p.end_point * t;
+      } else {
+        const double theta = p.arc.alpha_start + t * p.arc.delta_theta;
+        p_body = Eigen::Vector3d(
+            p.arc.center.x() + p.arc.R * std::cos(theta),
+            p.arc.center.y() + p.arc.R * std::sin(theta),
+            0.0);
+      }
+      const Eigen::Vector3f p_world(
+          static_cast<float>(drone_pos.x() + cy * p_body.x() - sy * p_body.y()),
+          static_cast<float>(drone_pos.y() + sy * p_body.x() + cy * p_body.y()),
+          static_cast<float>(drone_pos.z() + p_body.z()));
+      const double d = esdfLookup(p_world);
+      if (std::isfinite(d) && d < cr) { valid_h[i] = false; break; }
+    }
+  }
+
+  int valid_h_count = 0;
+  for (bool v : valid_h) if (v) ++valid_h_count;
+
+  const int np = static_cast<int>(pitched_prims_.size());
+  std::vector<bool> valid_p(np, true);
+  for (int i = 0; i < np; ++i) {
+    const Primitive& p = pitched_prims_[i];
+    for (int s = 1; s <= kNumSamples; ++s) {
+      const double t = static_cast<double>(s) / kNumSamples;
+      // Pitched primitives are straight rays — sample fraction of end_point.
+      const Eigen::Vector3d p_body = p.end_point * t;
+      const Eigen::Vector3f p_world(
+          static_cast<float>(drone_pos.x() + cy * p_body.x() - sy * p_body.y()),
+          static_cast<float>(drone_pos.y() + sy * p_body.x() + cy * p_body.y()),
+          static_cast<float>(drone_pos.z() + p_body.z()));
+      const double d = esdfLookup(p_world);
+      if (std::isfinite(d) && d < cr) { valid_p[i] = false; break; }
+    }
+  }
+
+  // ── 4. Scoring — identical math to the cloud path ─────────────────────
+  // Goal direction in body frame
+  const Eigen::Vector3d to_goal_w = waypoint - drone_pos;
+  const double goal_az_body = normalizeAngle(
+      std::atan2(to_goal_w.y(), to_goal_w.x()) - drone_yaw);
+
+  double best_cost = std::numeric_limits<double>::infinity();
+  int best_idx = -1;
+
+  for (int i = 0; i < nh; ++i) {
+    if (!valid_h[i]) continue;
+    const Primitive& p = horiz_prims_[i];
+
+    // Angular cost toward goal
+    const double daz = std::abs(normalizeAngle(p.terminal_az - goal_az_body));
+    double cost = cfg_.w_goal * daz;
+
+    // Smoothness — penalise switching away from previous best
+    if (prev_best_ >= 0 && prev_best_ < nh) {
+      const double dp = std::abs(normalizeAngle(
+          p.terminal_az - horiz_prims_[prev_best_].terminal_az));
+      cost += cfg_.w_prev * dp;
+    }
+
+    // Positional cost: reward primitives whose endpoint closes distance to goal
+    const Eigen::Vector3d end_world(
+        drone_pos.x() + cy * p.end_point.x() - sy * p.end_point.y(),
+        drone_pos.y() + sy * p.end_point.x() + cy * p.end_point.y(),
+        drone_pos.z() + p.end_point.z());
+    const double dist_end_to_goal = (end_world - waypoint).norm();
+    cost += cfg_.w_pos * dist_end_to_goal;
+
+    if (cost < best_cost) { best_cost = cost; best_idx = i; }
+  }
+
+  result.best_primitive_idx = best_idx;
+  prev_best_ = best_idx;
+
+  // ── 5. Velocity from selected primitive ───────────────────────────────
+  if (best_idx >= 0) {
+    const Primitive& p = horiz_prims_[best_idx];
+    // Adaptive speed: ramp down near obstacles, also clamp during recovery
+    const double valid_frac = nh > 0 ? static_cast<double>(valid_h_count) / nh : 1.0;
+    double speed = adaptiveSpeed(result.closest_obstacle_dist, valid_frac);
+    if (recovery_cycles_remaining_ > 0)
+      speed = std::min(speed, cfg_.recovery_max_speed);
+
+    // Initial heading of the primitive (body frame) → world frame velocity
+    const double az_body = p.az_angle;
+    const double az_world = drone_yaw + az_body;
+    Eigen::Vector3d v(
+        speed * std::cos(az_world),
+        speed * std::sin(az_world),
+        0.0);
+
+    // Altitude P-controller (waypoint z is target altitude)
+    const double dz = waypoint.z() - drone_pos.z();
+    v.z() = std::clamp(cfg_.alt_kp * dz, -cfg_.max_vz, cfg_.max_vz);
+
+    result.velocity = v;
+  }
+
+  return result;
+}
+
 }  // namespace uav_local_planner

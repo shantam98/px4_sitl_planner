@@ -69,10 +69,18 @@ def _launch_setup(context, *args, **kwargs):
     nvblox_on   = nvblox_cfg.get('enable', True)
 
     # ── cuVSLAM composable node ─────────────────────────────────────────
-    # RGBD mode (tracking_mode=2): single colour image + depth + camera_info.
-    # Mirrors the teammate's working setup and the real D415's natural output
-    # (colour + on-chip depth). No stereo timestamp sync to worry about.
-    tracking_mode = cuvslam_cfg.get('tracking_mode', 2)
+    # Stereo mode (tracking_mode=0). Mirrors the proven configuration from
+    # the in-repo Semantic_Cuda_optimized_Visual_Slam launch file (which
+    # ships against real D415 hardware):
+    #   - num_cameras: 2 (left + right IR rectified)
+    #   - camera_optical_frames overrides the camera_info frame_id, so we
+    #     don't depend on Gazebo's <optical_frame_id> SDF support at all
+    #   - cuVSLAM owns map→odom; px4_odom_bridge keeps odom→base_link
+    tracking_mode = cuvslam_cfg.get('tracking_mode', 0)
+    optical_frames = cuvslam_cfg.get('camera_optical_frames', [
+        'stereo_left_cam_optical_frame',
+        'stereo_right_cam_optical_frame',
+    ])
 
     visual_slam_node = ComposableNode(
         name='visual_slam_node',
@@ -81,18 +89,26 @@ def _launch_setup(context, *args, **kwargs):
         parameters=[{
             'use_sim_time': True,
             'tracking_mode': tracking_mode,
-            'num_cameras': cuvslam_cfg.get('num_cameras', 1),
+            'num_cameras': cuvslam_cfg.get('num_cameras', 2),
             'enable_image_denoising': False,
             'rectified_images': cuvslam_cfg.get('rectified_images', True),
             'enable_imu_fusion': cuvslam_cfg.get('enable_imu_fusion', False),
+            'image_jitter_threshold_ms': cuvslam_cfg.get('image_jitter_threshold_ms', 33.34),
+            'enable_slam_visualization': True,
+            'enable_landmarks_view': True,
+            'enable_observations_view': True,
             'map_frame':  cuvslam_cfg.get('map_frame',  'map'),
             'odom_frame': cuvslam_cfg.get('odom_frame', 'odom'),
             'base_frame': cuvslam_cfg.get('base_frame', 'base_link'),
+            'camera_optical_frames': optical_frames,
+            'publish_map_to_odom_tf':  cuvslam_cfg.get('publish_map_to_odom_tf',  True),
+            'publish_odom_to_base_tf': cuvslam_cfg.get('publish_odom_to_base_tf', False),
         }],
         remappings=[
-            ('visual_slam/image_0',       topics_v.get('image_0',       '/drone/rgbd/image')),
-            ('visual_slam/camera_info_0', topics_v.get('camera_info_0', '/drone/rgbd/camera_info')),
-            ('visual_slam/depth_0',       topics_v.get('depth_0',       '/drone/rgbd/depth')),
+            ('visual_slam/image_0',       topics_v.get('image_0',       '/drone/stereo/left/image')),
+            ('visual_slam/camera_info_0', topics_v.get('camera_info_0', '/drone/stereo/left/camera_info')),
+            ('visual_slam/image_1',       topics_v.get('image_1',       '/drone/stereo/right/image')),
+            ('visual_slam/camera_info_1', topics_v.get('camera_info_1', '/drone/stereo/right/camera_info')),
             ('visual_slam/imu',           topics_v.get('imu',           '/drone/imu')),
         ],
     )

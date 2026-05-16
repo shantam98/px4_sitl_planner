@@ -2,7 +2,7 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
@@ -11,14 +11,28 @@ def generate_launch_description():
     pkg = get_package_share_directory('uav_local_planner')
     mp_config = os.path.join(pkg, 'config', 'mp_params.yaml')
 
-    use_mp = LaunchConfiguration('use_mp', default='true')
+    use_mp           = LaunchConfiguration('use_mp',           default='true')
+    planner_backend  = LaunchConfiguration('planner_backend',  default='mp')
+
+    # Condition helpers — only one MP-family node runs at a time.
+    is_mp_baseline = PythonExpression([
+        "'", use_mp, "' == 'true' and '", planner_backend, "' == 'mp'"])
+    is_mp_esdf = PythonExpression([
+        "'", use_mp, "' == 'true' and '", planner_backend, "' == 'mp_esdf'"])
 
     return LaunchDescription([
 
         DeclareLaunchArgument(
-            'use_mp',
-            default_value='true',
-            description='Use Motion Primitive planner (true) or legacy VFH3D (false)'),
+            'use_mp', default_value='true',
+            description='Use Motion Primitive planner (true) or legacy VFH3D (false).'),
+
+        DeclareLaunchArgument(
+            'planner_backend', default_value='mp',
+            description=(
+                'When use_mp:=true, picks the MP variant: '
+                '"mp" (raw-cloud baseline) or "mp_esdf" (nvblox ESDF voxel hash).'
+                'For the ESDF variant, ensure cuVSLAM+nvblox stack is up '
+                'and publishing /nvblox_node/static_esdf_pointcloud.')),
 
         Node(
             package='uav_local_planner',
@@ -34,13 +48,25 @@ def generate_launch_description():
             }],
         ),
 
-        # ── Motion Primitive planner (default) ─────────���──────────────────
-        # All tuning lives in config/mp_params.yaml
+        # ── Motion Primitive — raw cloud baseline ─────────────────────────
+        # planner_backend:=mp (default). Reads /drone/tof_merged/points.
         Node(
-            condition=IfCondition(use_mp),
+            condition=IfCondition(is_mp_baseline),
             package='uav_local_planner',
             executable='mp_node',
             name='mp_node',
+            output='screen',
+            parameters=[mp_config, {'use_sim_time': True}],
+        ),
+
+        # ── Motion Primitive — nvblox ESDF variant ────────────────────────
+        # planner_backend:=mp_esdf. Reads /nvblox_node/static_esdf_pointcloud.
+        # Same arc primitives, same scoring weights, different obstacle source.
+        Node(
+            condition=IfCondition(is_mp_esdf),
+            package='uav_local_planner',
+            executable='mp_esdf_node',
+            name='mp_esdf_node',
             output='screen',
             parameters=[mp_config, {'use_sim_time': True}],
         ),

@@ -103,6 +103,16 @@ public:
     tfs.push_back(make_tf("base_link", "stereo_right_cam_link",
                            0.2, -0.0275, 0.02, 0, 0, 0, t));
 
+    // ── stereo_{left,right}_cam_link → stereo_{left,right}_cam_optical_frame
+    // Standard ROS body→optical rotation: RPY(-π/2, 0, -π/2).
+    // FLU body (X forward, Y left, Z up) → optical (Z forward, X right, Y down).
+    // cuVSLAM's camera_optical_frames parameter points at these names directly,
+    // so no <optical_frame_id> needed in the SDF — the TFs alone suffice.
+    tfs.push_back(make_tf("stereo_left_cam_link",  "stereo_left_cam_optical_frame",
+                           0, 0, 0, -M_PI_2, 0, -M_PI_2, t));
+    tfs.push_back(make_tf("stereo_right_cam_link", "stereo_right_cam_optical_frame",
+                           0, 0, 0, -M_PI_2, 0, -M_PI_2, t));
+
     broadcaster_->sendTransform(tfs);
     RCLCPP_INFO(get_logger(), "Published %zu static transforms", tfs.size());
   }

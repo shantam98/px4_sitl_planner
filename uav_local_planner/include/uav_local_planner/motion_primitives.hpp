@@ -5,6 +5,8 @@
 #include <pcl/point_types.h>
 #include <vector>
 #include <cmath>
+#include <unordered_map>
+#include <cstdint>
 
 namespace uav_local_planner {
 
@@ -89,6 +91,30 @@ public:
       double drone_yaw,
       const Eigen::Vector3d& waypoint);
 
+  // ── ESDF-based scoring path (Phase B, additive) ─────────────────────
+  // Replaces the (cloud, history-buffer) approach with (ESDF voxel hash,
+  // sample-along-primitive) for the benchmark comparison. The legacy
+  // cloud path above is unchanged.
+
+  // Populate voxel hash from incoming nvblox ESDF point cloud.
+  // esdf_cloud : sensor_msgs/PointCloud2 with x,y,z + intensity (signed
+  //              distance to nearest obstacle in metres), all in map frame.
+  // voxel_size : metres per voxel (matches nvblox config; default 0.05).
+  void updateEsdf(const pcl::PointCloud<pcl::PointXYZI>& esdf_cloud,
+                  double voxel_size = 0.05);
+
+  // ESDF analog of update(). Samples each primitive in body frame,
+  // transforms to map frame via (drone_pos, drone_yaw), queries the
+  // voxel hash. Scoring/bypass/recovery logic identical to update().
+  MPResult updateWithEsdf(
+      const Eigen::Vector3d& drone_pos,
+      double drone_yaw,
+      const Eigen::Vector3d& waypoint);
+
+  // Signed distance at a map-frame point. Returns +inf if the voxel
+  // isn't populated (treat as deep free space).
+  double esdfLookup(const Eigen::Vector3f& world_point) const;
+
   void reset();
 
   // Read-only access for diagnostics
@@ -96,6 +122,7 @@ public:
   int numPitchedPrims() const { return static_cast<int>(pitched_prims_.size()); }
   BypassState bypassState() const { return bypass_state_; }
   bool inRecovery() const { return recovery_cycles_remaining_ > 0; }
+  std::size_t esdfVoxelCount() const { return esdf_voxels_.size(); }
 
 private:
   // ── Pre-computed arc geometry ────────────────────────────────────────
@@ -153,6 +180,25 @@ private:
 
   // Recovery cooldown
   int recovery_cycles_remaining_{0};  // decremented each non-ESTOP cycle
+
+  // ── ESDF state (Phase B) ─────────────────────────────────────────────
+  // Quantised map-frame voxel coords as the hash key. Boost-style int mix.
+  struct VoxelKey {
+    int x, y, z;
+    bool operator==(const VoxelKey& o) const noexcept {
+      return x == o.x && y == o.y && z == o.z;
+    }
+  };
+  struct VoxelKeyHash {
+    std::size_t operator()(const VoxelKey& k) const noexcept {
+      std::size_t h = std::hash<int>{}(k.x);
+      h ^= std::hash<int>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<int>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  std::unordered_map<VoxelKey, float, VoxelKeyHash> esdf_voxels_;
+  double esdf_voxel_size_{0.05};  // metres per voxel (set by updateEsdf)
 };
 
 }  // namespace uav_local_planner

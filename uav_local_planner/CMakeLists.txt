@@ -66,7 +66,17 @@ target_include_directories(mp_node PUBLIC
   ${PCL_INCLUDE_DIRS})
 target_link_libraries(mp_node motion_primitives ${PCL_LIBRARIES})
 
-install(TARGETS vfh3d vfh3d_node waypoint_manager_node motion_primitives mp_node
+# ESDF variant — shares the motion_primitives library, swaps the obstacle
+# subscription from raw cloud to nvblox ESDF point cloud.
+add_executable(mp_esdf_node src/mp_esdf_node.cpp)
+ament_target_dependencies(mp_esdf_node ${DEPS_MP})
+target_include_directories(mp_esdf_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${EIGEN3_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS})
+target_link_libraries(mp_esdf_node motion_primitives ${PCL_LIBRARIES})
+
+install(TARGETS vfh3d vfh3d_node waypoint_manager_node motion_primitives mp_node mp_esdf_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME})

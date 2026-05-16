@@ -6,39 +6,52 @@
 vslam:
   # Master switch. When false, vslam.launch.py emits no nodes — stack falls back
   # to the EKF2-only path with OctoMap mapping (handled by full_stack.launch.py).
-  enable: false
+  enable: true
 
   # ── cuVSLAM (isaac_ros_visual_slam) ─────────────────────────────────────
   cuvslam:
-    # 0 = multicamera stereo
-    # 1 = mono + IMU
-    # 2 = RGBD (single colour image + depth)   ← used here
-    # RGBD mirrors the teammate's working sim setup and the real D415's
-    # natural output (colour + on-chip depth). Avoids stereo timestamp sync
-    # and the optical-frame mismatch issues we hit with the stereo IR pair.
-    tracking_mode: 2
-    num_cameras: 1
+    # tracking_mode:
+    #   0 = stereo only           ← our default (D415-style stereo IR)
+    #   1 = stereo + IMU fusion   ← enable when an IMU bridge is wired
+    # RGBD mode (was 2) isn't a real value in this Isaac ROS release — the
+    # proven path mirrors NVIDIA's stock RealSense launch: stereo IR pair,
+    # cuVSLAM computes depth via baseline triangulation.
+    tracking_mode: 0
+    num_cameras: 2
 
-    # Sim RGBD camera is pinhole-perfect; real D415 driver delivers rectified.
+    # Sim stereo pair is pinhole-perfect; real D415 IR streams are also rectified.
     rectified_images: true
 
-    # IMU fusion: keep off until accel/gyro biases on the real platform are
-    # calibrated. D415 has no IMU so this stays false in sim too.
+    # IMU fusion: D415 has no IMU; sim has no IMU either.
     enable_imu_fusion: false
 
-    # Input topic remaps — point at the existing /drone/rgbd/* topics that
-    # have been publishing reliably in our sim (used by MP today as well).
+    # Image jitter threshold matches the sim camera rate (30 Hz → ~33 ms).
+    image_jitter_threshold_ms: 33.34
+
+    # Input topic remaps — stereo IR pair from our SDF.
     topics:
-      image_0:       /drone/rgbd/image
-      camera_info_0: /drone/rgbd/camera_info
-      depth_0:       /drone/rgbd/depth
+      image_0:       /drone/stereo/left/image
+      camera_info_0: /drone/stereo/left/camera_info
+      image_1:       /drone/stereo/right/image
+      camera_info_1: /drone/stereo/right/camera_info
       imu:           /drone/imu          # only used if enable_imu_fusion=true
+
+    # Explicit optical-frame names. cuVSLAM uses these instead of the
+    # frame_id in incoming CameraInfo — sidesteps any Gazebo SDF tagging
+    # issues. Both frames are published by tf_static_broadcaster with the
+    # standard FLU→optical rotation (RPY -π/2, 0, -π/2).
+    camera_optical_frames:
+      - stereo_left_cam_optical_frame
+      - stereo_right_cam_optical_frame
 
     # Frames
     map_frame:       map
     odom_frame:      odom
     base_frame:      base_link
-    rectified_images_frame: rgbd_cam_link
+    # cuVSLAM owns map→odom. px4_odom_bridge still owns odom→base_link
+    # (PX4 EKF state). Avoid duplicate publishers on the same edge.
+    publish_map_to_odom_tf: true
+    publish_odom_to_base_tf: false
 
   # ── nvblox dense mapping ────────────────────────────────────────────────
   # Set enable=false to run cuVSLAM standalone (useful for validating tracking
