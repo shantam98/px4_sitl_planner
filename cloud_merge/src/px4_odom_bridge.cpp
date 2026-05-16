@@ -57,8 +57,14 @@ public:
 private:
   void odom_cb(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
   {
-    // PX4 timestamp is in microseconds
-    rclcpp::Time stamp(static_cast<int64_t>(msg->timestamp) * 1000LL, RCL_ROS_TIME);
+    // Stamp at the node's current clock, NOT at PX4's msg->timestamp.
+    // PX4 SITL publishes its timestamp as microseconds-since-Unix-epoch
+    // (wall clock), independent of Gazebo's sim time. Using the node's
+    // clock keeps TF stamps consistent with the rest of the stack:
+    //   - sim:      get_clock()->now() returns /clock (sim time) when use_sim_time=true
+    //   - hardware: get_clock()->now() returns wall clock when use_sim_time=false
+    // Tiny added latency (~1–5 ms) is well within TF extrapolation tolerance.
+    rclcpp::Time stamp = this->get_clock()->now();
 
     // ── Position: NED → ENU ─────────────────────────────────────────
     double px =  msg->position[1];   // east  = y_ned
