@@ -78,6 +78,16 @@ public:
     // SDF pose: <pose>0.2 0 0.02 0 0 0</pose>
     tfs.push_back(make_tf("base_link", "rgbd_cam_link", 0.2, 0.0, 0.02, 0,0,0, t));
 
+    // ── rgbd_cam_link → rgbd_cam_optical_frame ───────────────────────
+    // Standard ROS body→optical rotation: RPY(-π/2, 0, -π/2).
+    // FLU body (X forward, Y left, Z up) → optical (Z forward, X right, Y down).
+    // cuVSLAM and other vision packages expect frame_id in optical convention;
+    // the Gazebo SDF tags images with this frame via <optical_frame_id>.
+    // Mirrors what realsense2_camera publishes on real D415 hardware
+    // (camera_color_frame → camera_color_optical_frame, same rotation).
+    tfs.push_back(make_tf("rgbd_cam_link", "rgbd_cam_optical_frame",
+                           0, 0, 0, -M_PI_2, 0, -M_PI_2, t));
+
     // ── base_link → bottom_cam_link ──────────────────────────────────
     // SDF pose: <pose>0 0 -0.05 0 1.5708 0</pose>  (pitched 90° down)
     tfs.push_back(make_tf("base_link", "bottom_cam_link", 0.0, 0.0, -0.05, 0, M_PI_2, 0, t));
