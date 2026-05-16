@@ -69,13 +69,19 @@ def _launch_setup(context, *args, **kwargs):
     nvblox_on   = nvblox_cfg.get('enable', True)
 
     # ── cuVSLAM composable node ─────────────────────────────────────────
+    # RGBD mode (tracking_mode=2): single colour image + depth + camera_info.
+    # Mirrors the teammate's working setup and the real D415's natural output
+    # (colour + on-chip depth). No stereo timestamp sync to worry about.
+    tracking_mode = cuvslam_cfg.get('tracking_mode', 2)
+
     visual_slam_node = ComposableNode(
         name='visual_slam_node',
         package='isaac_ros_visual_slam',
         plugin='nvidia::isaac_ros::visual_slam::VisualSlamNode',
         parameters=[{
             'use_sim_time': True,
-            'num_cameras': cuvslam_cfg.get('num_cameras', 2),
+            'tracking_mode': tracking_mode,
+            'num_cameras': cuvslam_cfg.get('num_cameras', 1),
             'enable_image_denoising': False,
             'rectified_images': cuvslam_cfg.get('rectified_images', True),
             'enable_imu_fusion': cuvslam_cfg.get('enable_imu_fusion', False),
@@ -84,10 +90,9 @@ def _launch_setup(context, *args, **kwargs):
             'base_frame': cuvslam_cfg.get('base_frame', 'base_link'),
         }],
         remappings=[
-            ('visual_slam/image_0',       topics_v.get('image_0',       '/drone/stereo/left/image')),
-            ('visual_slam/image_1',       topics_v.get('image_1',       '/drone/stereo/right/image')),
-            ('visual_slam/camera_info_0', topics_v.get('camera_info_0', '/drone/stereo/left/camera_info')),
-            ('visual_slam/camera_info_1', topics_v.get('camera_info_1', '/drone/stereo/right/camera_info')),
+            ('visual_slam/image_0',       topics_v.get('image_0',       '/drone/rgbd/image')),
+            ('visual_slam/camera_info_0', topics_v.get('camera_info_0', '/drone/rgbd/camera_info')),
+            ('visual_slam/depth_0',       topics_v.get('depth_0',       '/drone/rgbd/depth')),
             ('visual_slam/imu',           topics_v.get('imu',           '/drone/imu')),
         ],
     )
