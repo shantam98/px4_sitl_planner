@@ -1,28 +1,33 @@
 # System Architecture — UAV Autonomy Stack
 
-> Single source of truth for scope freeze. Last updated 2026-05-15.
+> Single source of truth. Last updated 2026-05-17.
+>
+> Assumed state: VLM-exploration + Semantic-VSLAM + Brain integration complete (per `INTEGRATION.md`), NanoOWL inference online, deployed on Jetson Orin Nano.
 >
 > Companion docs:
-> - `PHASE2_VSLAM_INTEGRATION.md` — cuVSLAM + nvblox wiring plan
-> - `SEMANTIC_LAYER.md` — VLM-driven semantic map (Component I of master plan)
-> - `SEE_POINT_FLY_IMPLEMENTATION.md` — global planner / VLM-driven navigation
-> - `PLANNER_BENCHMARK_DRAFT.md` — MP vs MIGHTY vs EGO comparison (draft)
+> - `INTEGRATION.md` — VLM exploration, semantic VSLAM, intent-routing brain wiring
+> - `PLANNER_BENCHMARK_DRAFT.md` — MP vs MP+ESDF ablation
+> - `PLANNER_ALTERNATIVES_REJECTED.md` — why EGO / MIGHTY / DWA-3D were ruled out
+> - `EMERGENCY_LANDING_SIM_ANALYSIS.md` — emergency landing FSM integration
 > - `../px4_sim/PX4_VERSION_MIGRATION.md` — keeping SITL aligned with hardware
 
 ---
 
 ## 1. Context
 
-The system is an autonomous UAV (F450 + Pixhawk FMU-V3, PX4 v1.16.1) for indoor inspection. Compute lives on a Jetson Orin Nano. Perception is built around an Intel RealSense D415 (stereo IR + RGBD + IMU**not** — D415 has no IMU) plus 5 MaixSense MS-A010 ring ToFs + 1 bottom-facing depth (sim already; hardware pending).
+The system is an autonomous UAV (F450 + Pixhawk FMU-V3, PX4 v1.16.1) for indoor inspection. Compute lives on a **Jetson Orin Nano (8 GB)**. Perception is built around an Intel RealSense D415 (stereo IR + RGBD; no onboard IMU) plus 5× MaixSense MS-A010 ring ToFs + 1× bottom-facing depth.
 
-The system has two primary autonomy modes:
-1. **Commanded navigation** — user issues natural-language instruction → VLM-driven Global Planner (See-Point-Fly extension) → waypoint stream → Dynamic Planner avoids obstacles → PX4 executes.
-2. **Emergency landing** — on battery low, signal loss, or sensor failure, the Emergency Landing FSM takes over and lands the drone using bottom + 5 side depth sensors.
+The system has three commanded-autonomy modes and one safety mode:
+
+1. **Analyse** — user asks "what do you see?" → brain captures current frame → VLM describe → response published. Drone hovers.
+2. **Exploit** — user names a known landmark (e.g. "go to the workbench") → brain looks up the pose in the Redis semantic graph → publishes target → planner executes.
+3. **Explore** — user names an unknown target → brain forwards to the VLM spatial-grounding pipeline → ground a 2D pixel + depth into a 3D pose → planner executes.
+4. **Emergency landing** — on battery low, signal loss, sensor failure, or VSLAM tracking loss, the Emergency Landing FSM takes over via the cmd_vel mux.
 
 Layered on top:
-- **Perception**: cuVSLAM (pose + drift-corrected `map → odom`) + nvblox (dense ESDF) + VLM semantic layer
-- **Self-adaptation**: mode arbitration, health monitoring, VSLAM tracking watchdog
-- **Flight Control**: PX4 onboard, with `setpoint_publisher_node` managing offboard lifecycle
+- **Perception**: cuVSLAM (stereo, `map → odom`) + nvblox (dense ESDF) + NanoOWL detector → semantic graph in Redis
+- **Self-adaptation**: cmd_vel mux, VSLAM tracking watchdog, health monitors
+- **Flight Control**: PX4 onboard, `setpoint_publisher_node` managing offboard lifecycle with ROTATING / AUTONOMOUS FSM
 
 ---
 
@@ -30,68 +35,72 @@ Layered on top:
 
 Status legend:
 - 🟢 **GREEN** — built & integrated in `planner_ws`
-- 🟢ᵃ **GREEN-amber** — built but needs packaging or last-mile wiring
-- 🔵 **BLUE** — v1 done, upgrade pending
-- 🔴 **RED** — in progress, not yet built
+- 🔵 **BLUE** — v1 shipped, optimisation pending
 - 🟡 **YELLOW** — TODO, not started
 - ⬜ **WHITE** — external (firmware / hardware)
+- ⬛ **GRAY** — sim-only
 
 ### 2.1 Perception
 
 | Node | Status | Package / path | Subscribes | Publishes | Owner |
 |---|---|---|---|---|---|
-| Realsense Camera Driver | 🟢 | apt `ros-humble-realsense2-camera` + `uav_hardware_bringup/launch/realsense.launch.py` | USB | `/camera/...` remapped to `/drone/stereo/{left,right}/{image,camera_info}`, `/drone/rgbd/{image,depth,camera_info,points}` | shared |
-| ToF MaixSense ring x5 | 🟢 | `maixsense_ws/sipeed_tof_ms_a010_ros` + `uav_hardware_bringup` relays | `/dev/maixsense_tof_<0..4>` (USB) | `/drone/tof_<N>/{depth,points}` (frame `tof_<N>_link`) | shared |
-| Bottom depth sensor | 🟢 sim / 🟡 hw | f450 SDF `bottom_cam_link` (sim). Hardware: 6th MaixSense OR D415 bottom slice (TBD) | sim or USB | `/drone/bottom_cam/depth` (sim) / `/sensor_bottom/depth/image_raw` (landing) | hardware track |
+| Realsense Camera Driver | 🟢 | apt `ros-humble-realsense2-camera` + `uav_hardware_bringup/launch/realsense.launch.py` | USB | `/drone/stereo/{left,right}/{image,camera_info}`, `/drone/rgbd/{image,depth,camera_info,points}` | shared |
+| ToF MaixSense ring ×5 | 🟢 | `maixsense_ws/sipeed_tof_ms_a010_ros` + `uav_hardware_bringup` relays | `/dev/maixsense_tof_<0..4>` (USB) | `/drone/tof_<N>/{depth,points}` | shared |
+| Bottom depth sensor | 🟢 | 6th MaixSense, bottom-facing | USB | `/drone/bottom_cam/depth` (sim) / `/sensor_bottom/depth/image_raw` (landing) | shared |
 | Cloud Merge Node | 🟢 | `cloud_merge/src/cloud_merge_node.cpp` | `/drone/tof_<0..4>/points` | `/drone/tof_merged/points` (frame `base_link`) | shared |
 | PX4 Odom Bridge | 🟢 | `cloud_merge/src/px4_odom_bridge.cpp` | `/fmu/out/vehicle_odometry` | `/drone/odom` (ENU), TF `odom → base_link` | shared |
-| TF Static Broadcaster | 🟢 | `cloud_merge/src/tf_static_broadcaster.cpp` | (params) | TF: `map → odom` (static, gated by Phase 2), `base_link → {tof_N_link, rgbd_cam_link, ...}` | shared |
-| Stereo Camera Info Publisher (sim only) | 🟢 | `cloud_merge/src/stereo_camera_info_publisher.cpp` | (params) | `/drone/stereo/{left,right}/camera_info` | shared |
-| **cuVSLAM Node** | 🔴 (Phase 2) | `isaac_vslam.sif` (Singularity) — wiring pending | stereo + camera_info | TF `map → odom`, `visual_slam/tracking/odometry`, `visual_slam/vis/*` | shared |
-| **nvblox Node** | 🔴 (Phase 3) | `isaac_vslam.sif` (Singularity) — wiring pending | cuVSLAM pose + `/drone/rgbd/depth` | `nvblox_node/static_esdf_pointcloud`, `static_map_slice`, mesh | shared |
+| TF Static Broadcaster | 🟢 | `cloud_merge/src/tf_static_broadcaster.cpp` | (params) | TF: `map → odom` (gated by `publish_map_to_odom`), `base_link → {tof_N_link, rgbd_cam_link, stereo_{left,right}_cam_optical_frame, ...}` | shared |
+| Stereo Camera Info Publisher | ⬛ sim only | `cloud_merge/src/stereo_camera_info_publisher.cpp` | (params) | `/drone/stereo/{left,right}/camera_info` | shared |
+| **cuVSLAM Node** | 🟢 | `isaac_vslam.sif` invoked by `uav_bringup/launch/vslam.launch.py` | stereo + camera_info | TF `map → odom`, `visual_slam/tracking/vo_pose`, `visual_slam/status`, `visual_slam/vis/*` | shared |
+| **nvblox Node** | 🟢 | `isaac_vslam.sif` invoked by `vslam.launch.py` | cuVSLAM pose + `/drone/rgbd/depth` + `/drone/rgbd/camera_info` | `nvblox_node/static_esdf_pointcloud`, `static_map_slice`, mesh | shared |
 
-### 2.2 Reflection & World Modelling
-
-| Node | Status | Package / path | Subscribes | Publishes | Owner |
-|---|---|---|---|---|---|
-| VLM Inference (API variant) | 🟢ᵃ packaging | `/home/shantam/irobot/Cuvslam/vlm_api_inference_node.py` | `/realsense/color/image_raw` | `/vlm/detections` (Detection2DArray) | semantic teammate |
-| VLM Inference (local, NanoOWL) | 🟢ᵃ packaging | `/home/shantam/irobot/Cuvslam/nanoowl_inference.py` | RGB image | `/nanoowl/detections` | semantic teammate |
-| Semantic Graph Pose Mapping | 🟢ᵃ packaging | `/home/shantam/irobot/Cuvslam/semantic_graph_combiner.py` | `/realsense/depth/image_rect_raw`, `/nanoowl/detections`, `/realsense/color/camera_info` | `/semantic_graph` (JSON String) | semantic teammate |
-| **Semantic Pose Graph DB** | 🔴 | (planned) `uav_semantic_keyframes` package | `/semantic_graph`, `visual_slam/vis/pose_graph_nodes` | SQLite DB on disk; `/uav/semantic_keyframes/latest`, `/uav/slam_path_semantic` | semantic teammate |
-| **nvblox semantic channel** (Component I.2) | 🔴 (deferred) | `isaac_vslam.sif` config | per-pixel class image | semantic voxels in `.nvblx` map | semantic teammate |
-
-### 2.3 Goal Management & Decision Making
+### 2.2 Semantic / Reflection layer (NanoOWL + Redis graph)
 
 | Node | Status | Package / path | Subscribes | Publishes | Owner |
 |---|---|---|---|---|---|
-| User Instruction Interface | 🟡 | (planned) `uav_global_planner` | (operator stdin / topic) | `/user/instruction` (String) | SPF track |
-| **VLM Spatial Grounding (SPF extension)** | 🟡 | (planned) extension of `vlm_api_inference_node.py` | `/user/instruction`, `/realsense/color/image_raw` | `/spf/target_pose` (PoseStamped) | SPF track |
-| **SPF Orchestrator** (= Global Planner) | 🔴 | (planned) `uav_global_planner` | `/spf/target_pose`, `/uav/mission_complete` | yaw setpoints → adapter, XY goals → waypoint_manager action | SPF track |
+| NanoOWL Inference | 🟢 | `uav_semantic_slam/uav_semantic_slam/nanoowl_inference_node.py` (TensorRT engine at `/opt/nanoowl/data/owl_image_encoder_patch32.engine`) | `/drone/rgbd/image`, `/nanoowl/query` (optional dynamic prompt) | `/nanoowl/detections` (`vision_msgs/Detection2DArray`, `class_id = label_string`) | semantic track |
+| Semantic Graph Combiner | 🟢 | `uav_semantic_slam/uav_semantic_slam/semantic_graph_combiner_node.py` | cuVSLAM pose, `/nanoowl/detections`, `/drone/rgbd/camera_info` | `/semantic_graph` (`std_msgs/String`, JSON) | semantic track |
+| Redis Writer | 🟢 | `uav_semantic_slam/uav_semantic_slam/redis_writer_node.py` | `/semantic_graph` | Redis: `semantic_graph:latest`, `semantic_graph:robot_pose`, `semantic_graph:node:<id>` (HASH), `semantic_graph:nodes_index` (ZSET by `last_seen_sec`), pubsub channel `semantic_graph` | semantic track |
+| Redis (server) | 🟢 | `redis-server` (systemd, `localhost:6379`) | Redis protocol | persistent landmark store | shared |
 
-### 2.4 Planning
+### 2.3 Goal Management & Brain
 
 | Node | Status | Package / path | Subscribes | Publishes | Owner |
 |---|---|---|---|---|---|
-| Waypoint Manager | 🟢ᵃ FSM upgrade pending | `uav_local_planner/src/waypoint_manager_node.cpp` | `/uav/navigate_to_goal` (action), `/uav/global_path` | `/uav/current_waypoint` (PoseStamped after upgrade), `/uav/mission_phase`, `/uav/mission_complete` | shared |
-| **Dynamic Planner (mp_node)** | 🔵 v1 done | `uav_local_planner/src/mp_node.cpp` | `/drone/tof_merged/points` (today) → `/drone/rgbd/points` (D415-only path), `/drone/odom`, `/uav/current_waypoint` | `/uav/cmd_vel` (TwistStamped), `/uav/vfh_status`, `/uav/mp_diag` | shared |
+| User Instruction Interface | 🟢 | `uav_vlm/uav_vlm/user_instruction_node.py` | stdin | `/user/instruction` (`std_msgs/String`) | brain track |
+| **uav_brain (intent router)** | 🟢 | `uav_brain/uav_brain/brain_node.py` | `/user/instruction`, Redis `semantic_graph:*`, `/drone/rgbd/image` | `/spf/target_pose` (analyse → none; exploit → from Redis; explore → forwards to grounding), `/user/instruction_explore`, `/uav/scene_report` (`std_msgs/String`), `/uav/brain_status` | brain track |
+| VLM Spatial Grounding | 🟢 | `uav_vlm/uav_vlm/vlm_spatial_grounding.py` | `/user/instruction_explore`, `/drone/rgbd/{image,depth}`, `/drone/odom` | `/spf/target_pose` (`PoseStamped`, frame `map`) | brain track |
+| SPF Orchestrator | 🟢 | `uav_global_planner/uav_global_planner/spf_orchestrator.py` | `/spf/target_pose`, `/uav/emergency_trigger`, `/uav/mission_complete` | action goals to `/uav/navigate_to_goal`, `/uav/global_planner_status` | brain track |
+| Planner Server (A* + spf_direct_mode) | 🟢 | `uav_planner_interface/src/planner_server_node.cpp` | action `/uav/navigate_to_goal`, nvblox ESDF | `/uav/global_path` (`nav_msgs/Path`) | shared |
+
+### 2.4 Local Planning
+
+| Node | Status | Package / path | Subscribes | Publishes | Owner |
+|---|---|---|---|---|---|
+| Waypoint Manager (SPF FSM) | 🟢 | `uav_local_planner/src/waypoint_manager_node.cpp` | `/uav/navigate_to_goal` (action), `/uav/global_path`, `/drone/odom` | `/uav/current_waypoint` (`PointStamped`), `/uav/mission_phase` (`std_msgs/String` — IDLE \| ROTATING \| TRANSLATING \| COMPLETE), `/uav/mission_complete` | shared |
+| Dynamic Planner — `mp_node` (baseline, raw cloud) | 🔵 v1 shipped | `uav_local_planner/src/mp_node.cpp` | `/drone/rgbd/points`, `/drone/odom`, `/uav/current_waypoint`, `/uav/mission_phase` | `/uav/cmd_vel` (`TwistStamped`), `/uav/mp_diag` | shared |
+| Dynamic Planner — `mp_esdf_node` (ESDF variant) | 🟢 | `uav_local_planner/src/mp_esdf_node.cpp` | `/nvblox_node/static_esdf_pointcloud`, `/drone/odom`, `/uav/current_waypoint` | `/uav/cmd_vel`, `/uav/mp_diag` (with `esdf_mode=1.0` + `esdf_voxel_count`) | shared |
+| Motion Primitives library | 🟢 | `uav_local_planner/src/motion_primitives.cpp` | (linked into both planner nodes) | (provides `updateBuffer`/`updateEsdf`/`update`/`updateWithEsdf` scoring entrypoints) | shared |
+
+Backend selection: `planner_backend:={mp, mp_esdf}` launch arg on `local_planner.launch.py`. Both share `config/mp_params.yaml`.
 
 ### 2.5 Self-Adaptation
 
 | Node | Status | Package / path | Subscribes | Publishes | Owner |
 |---|---|---|---|---|---|
-| **cmd_vel Mux / Mode Arbiter** | 🟡 | (planned) `uav_safety/src/cmd_vel_mux.cpp` | `/uav/cmd_vel`, `/landing/cmd_vel`, `/landing/enable` | `/uav/cmd_vel_safe` → `setpoint_publisher_node` | shared |
-| **VSLAM Tracking Watchdog** | 🟡 | (planned) `uav_safety/src/vslam_watchdog.cpp` | `visual_slam/status` | `/uav/emergency_trigger` (Bool) | shared |
-| **Health Signal Adapters** | 🟡 | (planned) `uav_health_signals/*` | `/fmu/out/battery_status`, `/fmu/out/manual_control_input`, sensor freshness | `/battery_percent`, `/signal_ok`, `/sensor_ok` | shared |
-| Geo-fence, RTL on RC loss, pre-arm checks | 🟢 native | PX4 firmware + QGC config | RC / GPS | PX4 internal failsafe | flight control |
+| cmd_vel Mux / Mode Arbiter | 🟡 | (planned) `uav_safety/src/cmd_vel_mux.cpp` | `/uav/cmd_vel`, `/landing/cmd_vel`, `/landing/enable` | `/uav/cmd_vel_safe` → setpoint_publisher | shared |
+| VSLAM Tracking Watchdog | 🟡 | (planned) `uav_safety/src/vslam_watchdog.cpp` | `visual_slam/status` | `/uav/emergency_trigger` (`Bool`) | shared |
+| Health Signal Adapters | 🟡 | (planned) `uav_health_signals/*` | `/fmu/out/battery_status`, `/fmu/out/manual_control_input`, sensor freshness | `/battery_percent`, `/signal_ok`, `/sensor_ok` | shared |
+| Geo-fence, RTL on RC loss, pre-arm | 🟢 native | PX4 firmware + QGC config | RC / GPS | PX4 internal failsafe | flight control |
 
 ### 2.6 Flight Control
 
 | Node | Status | Package / path | Subscribes | Publishes | Owner |
 |---|---|---|---|---|---|
-| Setpoint Publisher Node | 🟢ᵃ FSM upgrade pending | `uav_control/src/setpoint_publisher_node.cpp` | `/uav/cmd_vel_safe` (post-mux), `/uav/mission_phase`, `/uav/current_waypoint` (PoseStamped), `/fmu/out/vehicle_status_v1` | `/fmu/in/trajectory_setpoint`, `/fmu/in/offboard_control_mode`, `/fmu/in/vehicle_command` | shared |
-| **Emergency Landing Node** | 🟢ᵃ integration | `/home/shantam/irobot/emergency_landing_sim/.../emergency_landing_node_px4.py` | 6 depth images, `/battery_percent`, `/signal_ok`, `/sensor_ok`, `/landing/offboard_ready` | `/landing/cmd_vel`, `/landing/enable`, `/emergency_landing_status` | landing teammate |
-| **Pixhawk Offboard Bridge** | 🟢ᵃ integration | `.../pixhawk_offboard_bridge.py` | `/landing/cmd_vel`, `/landing/enable`, `/fmu/out/vehicle_status` | `/fmu/in/offboard_control_mode`, `/fmu/in/trajectory_setpoint`, `/fmu/in/vehicle_command`, `/landing/offboard_ready` | landing teammate |
-| MicroXRCE-DDS Agent | 🟢 | external binary `/scratch/$USER/irobot/Micro-XRCE-DDS-Agent/build/MicroXRCEAgent` | PX4 over USB serial or UDP | `/fmu/out/*`, accepts `/fmu/in/*` | shared |
+| Setpoint Publisher (SPF FSM: STARTUP → TAKEOFF → HOVER → ROTATING → AUTONOMOUS) | 🟢 | `uav_control/src/setpoint_publisher_node.cpp` | `/uav/cmd_vel` (or `_safe` post-mux), `/uav/mission_phase`, `/fmu/out/vehicle_status_v2`, `/fmu/out/vehicle_local_position_v2` (hardware) | `/fmu/in/trajectory_setpoint`, `/fmu/in/offboard_control_mode`, `/fmu/in/vehicle_command` | shared |
+| Emergency Landing Node | 🟢ᵃ | `uav_emergency_landing/.../emergency_landing_node_px4.py` | 6 depth images, `/battery_percent`, `/signal_ok`, `/sensor_ok`, `/landing/offboard_ready` | `/landing/cmd_vel`, `/landing/enable`, `/emergency_landing_status` | landing track |
+| Pixhawk Offboard Bridge (landing) | 🟢ᵃ | `.../pixhawk_offboard_bridge.py` | `/landing/cmd_vel`, `/landing/enable`, `/fmu/out/vehicle_status` | `/fmu/in/*`, `/landing/offboard_ready` | landing track |
+| MicroXRCE-DDS Agent | 🟢 | external `MicroXRCEAgent` binary | PX4 over USB serial or UDP | `/fmu/out/*`, accepts `/fmu/in/*` | shared |
 | PX4 Firmware | ⬜ | Pixhawk FMU-V3, v1.16.1 | sensors, RC | flight | flight controller |
 | GPS + onboard IMU | ⬜ | Pixhawk | — | feeds PX4 EKF2 | flight controller |
 
@@ -99,92 +108,80 @@ Status legend:
 
 | Node | Status | Package / path | Notes |
 |---|---|---|---|
-| ros_gz_bridge | 🟢 | `ros-humble-ros-gzharmonic` apt | Gazebo ↔ ROS 2 topic bridge |
-| Gazebo cmdvel bridge | 🟢 (sim of landing) | `emergency_landing_sim/gazebo_cmdvel_bridge` | Twist → SetEntityState; floor-detection |
-| Rotor spin animation | 🟢 (sim only) | `emergency_landing_sim/rotor_spin_node` | Visual, not flight-critical |
+| ros_gz_bridge | ⬛ | `ros-humble-ros-gzharmonic` apt | Gazebo ↔ ROS 2 topic bridge |
+| Gazebo cmdvel bridge | ⬛ | `emergency_landing_sim/gazebo_cmdvel_bridge` | Twist → SetEntityState; floor-detection (landing-sim only) |
 
 ---
 
 ## 3. Top-level data flow
 
 ```
-  user text ──► User Instruction ──► VLM Spatial Grounding ──► /spf/target_pose
-                                                                       │
-                                                                       ▼
-                                                            SPF Orchestrator (trivial)
-                                                            calls /uav/navigate_to_goal
-                                                                       │
-                                                                       ▼
-                                                            Planner Server (action)
-                                                                       │ /uav/global_path
-                                                                       ▼
-                                                  Waypoint Manager (rotate-then-translate FSM)
-                                                                   ┌───┴────┐
-                                                          ROTATING │        │ TRANSLATING
-                                                                   │        │
-                              /uav/current_waypoint = (XYcur, yaw_tgt)      /uav/current_waypoint = (XYtgt, yaw_tgt)
-                              /uav/mission_phase    = ROTATING               /uav/mission_phase    = TRANSLATING
-                                                                   │        │
-                                  ┌────────────────────────────────┘        └──┐
-                                  ▼                                            ▼
-                       Dynamic Planner (mp_node)                  Dynamic Planner (mp_node)
-                         emits zero cmd_vel                         emits normal cmd_vel
-                                  │                                            │
-                                  └──────────────► /uav/cmd_vel ◄──────────────┘
-                                                       │
+   stdin
+     │ /user/instruction
+     ▼
+   uav_brain  ──── reads Redis semantic_graph:* ───── (Redis on localhost:6379)
+     │
+     ├── analyse:  /uav/scene_report  ◄── one-shot VLM describe
+     │
+     ├── exploit:  /spf/target_pose (built from Redis position_world)
+     │
+     └── explore:  /user/instruction_explore ──► vlm_spatial_grounding
+                                                       │  /spf/target_pose
                                                        ▼
-                                              cmd_vel MUX  ◄── /landing/cmd_vel (if /landing/enable)
-                                                       │  /uav/cmd_vel_safe
+                                              SPF Orchestrator
+                                                       │ action /uav/navigate_to_goal
                                                        ▼
-                                      Setpoint Publisher Node
-                                       (reads mission_phase to
-                                        emit yaw-only setpoint
-                                        during ROTATING)
-                                                       │ /fmu/in/trajectory_setpoint
+                                              Planner Server
+                                                       │ /uav/global_path
                                                        ▼
-                                              MicroXRCEAgent ──► PX4 ──► motors
+                                         Waypoint Manager (FSM)
+                                          ┌────────────┼─────────────┐
+                                  ROTATING│   TRANSLATING            │ COMPLETE
+                                          │            │             │
+                          /uav/mission_phase + /uav/current_waypoint │
+                                          │            │             │
+                                          ▼            ▼             ▼
+                                       mp_node OR mp_esdf_node      (idle)
+                                        │ /uav/cmd_vel
+                                        ▼
+                                   cmd_vel MUX  ◄── /landing/cmd_vel (if /landing/enable)
+                                        │ /uav/cmd_vel_safe
+                                        ▼
+                              Setpoint Publisher (HOVER → ROTATING → AUTONOMOUS)
+                                        │ /fmu/in/trajectory_setpoint
+                                        ▼
+                                MicroXRCE-DDS Agent ──► PX4 ──► motors
 
-  Sensor stack → Cloud Merge / Stereo / Depth → cuVSLAM → TF map→odom (drift-corrected)
-                                                          │
-                                                          └──► nvblox ESDF ──► Global Planner, Dynamic Planner
+   Perception:
+     D415 stereo + camera_info ──► cuVSLAM ──► TF map→odom + pose
+                                       │
+                                       ├──► nvblox ──► /nvblox_node/static_esdf_pointcloud ──► mp_esdf_node + planner_server
+                                       │
+                                       └──► /visual_slam/tracking/vo_pose ──► semantic_graph_combiner
+                                                                                       ▲
+                                       D415 RGB ──► NanoOWL ──► /nanoowl/detections ───┘
+                                                                                       │
+                                                                                       ▼
+                                                                              redis_writer ──► Redis ──► uav_brain
 
-  VLM Detections → Semantic Graph → Semantic Pose Graph DB
-                                                          │
-                                                          └──► SPF Orchestrator (v2 closed-loop only)
-
-  Watchdogs (VSLAM tracking, health signals) → /uav/emergency_trigger → Emergency Landing FSM
+   Watchdogs (VSLAM tracking, health signals) ──► /uav/emergency_trigger ──► Emergency Landing FSM ──► /landing/cmd_vel
 ```
 
 ---
 
 ## 3.1 System node graph
 
-> Renders in any Mermaid-aware viewer (GitHub, VS Code Mermaid extension, Obsidian, etc.).
->
-> Layout: **sensors on left → flow rightward through perception, semantic, planning, safety, control → motors on right**.
-
-### Legend
-
-| Color | Status |
-|---|---|
-| 🟢 **GREEN** | Built & integrated |
-| 🟠 **AMBER** | Built but packaging/upgrade pending |
-| 🔵 **BLUE** | v1 done, upgrade pending (e.g., benchmark) |
-| 🔴 **RED** | In progress |
-| 🟡 **YELLOW** | TODO, not started |
-| ⚪ **WHITE** | External (firmware / hardware) |
-| ⬛ **GRAY** | Sim-only |
-
-### Graph
+> Renders in any Mermaid-aware viewer.
+> Layout: sensors on left → flow rightward through perception, semantic, brain, planning, safety, control → motors on right.
 
 ```mermaid
 graph LR
-    %% ─────────── SENSORS (left) ───────────
+    %% ─────────── SENSORS ───────────
     subgraph SEN["📷 Sensors"]
         direction TB
         D415["RealSense D415<br/>stereo IR + RGBD"]
         TOFx5["MaixSense ToF ×5<br/>(ring)"]
-        BTM["Bottom depth"]
+        BTM["MaixSense bottom"]
     end
 
     %% ─────────── PERCEPTION ───────────
@@ -193,32 +190,36 @@ graph LR
         CM["Cloud Merge<br/>/drone/tof_merged"]
         POB["PX4 Odom Bridge<br/>NED → ENU"]
         TFB["TF Static<br/>Broadcaster"]
-        SCIP["Stereo CamInfo Pub<br/>(sim only)"]
-        CV["cuVSLAM<br/>map → odom TF"]
-        NV["nvblox<br/>TSDF / ESDF"]
+        CV["cuVSLAM<br/>map → odom"]
+        NV["nvblox<br/>ESDF voxel hash"]
     end
 
-    %% ─────────── REFLECTION ───────────
-    subgraph REF["Reflection / Semantic"]
+    %% ─────────── SEMANTIC LAYER ───────────
+    subgraph SEM["Semantic Layer"]
         direction TB
-        VLM["VLM Inference<br/>API or NanoOWL"]
+        NOWL["NanoOWL<br/>TensorRT inference"]
         SGC["Semantic Graph<br/>Combiner"]
-        SDB["Semantic Pose<br/>Graph DB"]
+        RW["Redis Writer"]
+        REDIS[("Redis<br/>semantic_graph:*")]
     end
 
-    %% ─────────── GOAL MANAGEMENT ───────────
-    subgraph GOAL["Goal Management"]
+    %% ─────────── BRAIN + GOAL ───────────
+    subgraph BRAIN["Brain + Goal Management"]
         direction TB
-        UII["User Instruction<br/>Interface"]
-        VSG["VLM Spatial<br/>Grounding"]
-        SPFO["SPF Orchestrator<br/>= Global Planner"]
+        UII["User Instruction<br/>stdin → /user/instruction"]
+        BR["uav_brain<br/>LLM intent routing"]
+        VSG["VLM Spatial<br/>Grounding (explore)"]
+        AN["analyse_helper<br/>(VLM describe)"]
+        SPFO["SPF Orchestrator"]
+        PS["Planner Server<br/>A* + spf_direct_mode"]
     end
 
     %% ─────────── PLANNING ───────────
-    subgraph PLAN["Planning"]
+    subgraph PLAN["Local Planning"]
         direction TB
-        WPM["Waypoint Manager<br/>rotate-then-translate FSM"]
-        MP["Dynamic Planner<br/>mp_node"]
+        WPM["Waypoint Manager<br/>IDLE→ROTATING→<br/>TRANSLATING→COMPLETE"]
+        MP["mp_node<br/>(raw cloud)"]
+        MPE["mp_esdf_node<br/>(ESDF voxel hash)"]
     end
 
     %% ─────────── SAFETY ───────────
@@ -226,7 +227,7 @@ graph LR
         direction TB
         MUX["cmd_vel Mux"]
         WD["VSLAM Watchdog"]
-        HSA["Health Adapters<br/>battery / RC / sensor"]
+        HSA["Health Adapters"]
     end
 
     %% ─────────── EMERGENCY LANDING ───────────
@@ -239,54 +240,64 @@ graph LR
     %% ─────────── FLIGHT CONTROL ───────────
     subgraph CTRL["Flight Control"]
         direction TB
-        SP["Setpoint Publisher<br/>lifecycle FSM"]
+        SP["Setpoint Publisher<br/>HOVER → ROTATING<br/>→ AUTONOMOUS"]
         DDS["MicroXRCE-DDS<br/>Agent"]
         PX4["PX4 Firmware<br/>+ Pixhawk IMU/GPS"]
     end
 
     MOT(["⚙ Motors"])
 
-    %% ───── Edges: sensor inputs ─────
+    %% ───── Sensor inputs ─────
     D415 --> CM
     TOFx5 --> CM
     BTM --> CM
-    D415 --> CV
-    SCIP -. sim only .-> CV
+    D415 -- stereo --> CV
+    D415 -- RGBD depth --> NV
+    D415 -- RGB --> NOWL
 
     %% ───── Perception flow ─────
-    CM --> NV
-    CV --> NV
     DDS -- /fmu/out/odom --> POB
     POB --> CV
+    CV --> NV
+    CV -- vo_pose --> SGC
+    CV -- status --> WD
 
     %% ───── Semantic ─────
-    D415 --> VLM
-    VLM --> SGC
-    SGC --> SDB
+    NOWL -- /nanoowl/detections --> SGC
+    SGC -- /semantic_graph (JSON) --> RW
+    RW --> REDIS
 
-    %% ───── Goal management ─────
-    UII --> VSG
-    D415 --> VSG
+    %% ───── Brain ─────
+    UII -- /user/instruction --> BR
+    REDIS -. labels lookup .-> BR
+    BR -- exploit: /spf/target_pose --> SPFO
+    BR -- explore: /user/instruction_explore --> VSG
+    BR --> AN
+    D415 -- RGB --> AN
+    D415 -- RGB+depth --> VSG
     VSG -- /spf/target_pose --> SPFO
 
-    %% ───── Planning ─────
-    SPFO -- action --> WPM
-    WPM -- /uav/current_waypoint<br/>+ mission_phase --> MP
-    NV -. ESDF .-> MP
+    %% ───── Goal → Planning ─────
+    SPFO -- action /uav/navigate_to_goal --> PS
+    PS -- /uav/global_path --> WPM
+    NV -. ESDF .-> PS
+    WPM -- waypoint + mission_phase --> MP
+    WPM -- waypoint + mission_phase --> MPE
+    NV -- ESDF --> MPE
 
     %% ───── Safety ─────
-    CV -- visual_slam/status --> WD
     WD -- emergency_trigger --> SPFO
     WD -- emergency_trigger --> EL
     DDS -- /fmu/out/battery_status --> HSA
     HSA --> EL
 
-    %% ───── Cmd-vel path ─────
+    %% ───── cmd_vel path ─────
     MP -- /uav/cmd_vel --> MUX
-    EL -- /landing/cmd_vel<br/>(Twist) --> MUX
+    MPE -- /uav/cmd_vel --> MUX
+    EL -- /landing/cmd_vel --> MUX
     EL -- /landing/enable --> MUX
-    MUX -- /uav/cmd_vel_safe<br/>(TwistStamped) --> SP
-    WPM -. mission_phase + current_waypoint .-> SP
+    MUX -- /uav/cmd_vel_safe --> SP
+    WPM -. mission_phase .-> SP
 
     %% ───── Landing direct bypass ─────
     EL --> POB2
@@ -299,121 +310,88 @@ graph LR
 
     %% ───── Color classes ─────
     classDef green   fill:#4caf50,stroke:#1b5e20,color:#fff,font-weight:bold
-    classDef amber   fill:#ffb74d,stroke:#e65100,color:#000,font-weight:bold
     classDef blue    fill:#42a5f5,stroke:#0d47a1,color:#fff,font-weight:bold
-    classDef red     fill:#ef5350,stroke:#b71c1c,color:#fff,font-weight:bold
     classDef yellow  fill:#fff176,stroke:#f57f17,color:#000,font-weight:bold
     classDef white   fill:#fafafa,stroke:#616161,color:#000
-    classDef gray    fill:#b0bec5,stroke:#455a64,color:#000,font-style:italic
+    classDef store   fill:#ce93d8,stroke:#4a148c,color:#000,font-weight:bold
 
-    %% Built & integrated
-    class D415,TOFx5,CM,POB,TFB,SP,DDS green
+    %% Built & integrated (post-INTEGRATION.md)
+    class D415,TOFx5,BTM,CM,POB,TFB,CV,NV,NOWL,SGC,RW,UII,BR,VSG,AN,SPFO,PS,WPM,MPE,SP,DDS,EL,POB2 green
 
-    %% Built, packaging or integration pending
-    class VLM,SGC,EL,POB2 amber
-
-    %% Built, FSM upgrade pending
-    class WPM,SP amber
-
-    %% v1 done, upgrade pending
+    %% v1 shipped, optimisation pending (still active in benchmark)
     class MP blue
 
-    %% In progress / not yet built
-    class CV,NV,SDB,SPFO red
-
-    %% TODO (not started)
-    class BTM,UII,VSG,MUX,WD,HSA yellow
-
-    %% Sim-only
-    class SCIP gray
+    %% TODO
+    class MUX,WD,HSA yellow
 
     %% External
     class PX4,MOT white
+
+    %% Redis backing store
+    class REDIS store
 ```
 
 ### Reading the graph
 
 - **Solid arrows** = primary data flow (every cycle)
-- **Dotted arrows** = control signals, optional inputs, or conditional flows
+- **Dotted arrows** = control signals, optional inputs, conditional flows, Redis queries
 - **Action arrows** labeled "action" = ROS 2 action server calls (with feedback + result)
-- **`/landing/enable` arrow into the mux** = control signal that selects which cmd_vel source flows forward
+- **`REDIS` purple cylinder** = persistent landmark store (out-of-band of DDS; brain polls via `redis` Python client)
 
-Key observations from the graph:
-- The cmd_vel mux is a single chokepoint between planners (MP, Emergency Landing) and the controller (`setpoint_publisher_node`). This is by design — fail-closed safety.
-- `WPM → SP` dotted line is the `mission_phase + current_waypoint` channel for yaw-only setpoints during the ROTATING phase (per `SEE_POINT_FLY_IMPLEMENTATION.md` §4.5.3).
-- `EL → POB2 → DDS` is a parallel path that bypasses the normal `setpoint_publisher_node` in emergency landing mode. This is a known asymmetry — the landing teammate's design has its own offboard bridge.
-- cuVSLAM (CV) is a sink for D415 stereo AND a source for the Watchdog AND nvblox AND the `map → odom` TF — the most-connected node in the perception layer.
+Key observations:
+- **Brain is the single decision point** for analyse / exploit / explore. Everything downstream (`SPFO → PS → WPM → MP[E] → SP → DDS → PX4`) is mode-agnostic.
+- **cuVSLAM is the most-connected perception node** — sink for D415 stereo + odometry feedback, source for nvblox, semantic combiner, watchdog, and `map→odom` TF.
+- **Redis is the only non-DDS data path** in the stack. Used because the semantic graph is queried sparsely (once per user instruction), accumulated continuously (5 Hz writes), and persists across restarts. Treating it as a topic would have meant either replaying the full graph every cycle or maintaining a stateful subscriber in the brain.
+- **mp_esdf_node and mp_node are mutually exclusive** at runtime — `planner_backend` launch arg picks one. Both still ship for the ablation in `PLANNER_BENCHMARK_DRAFT.md`.
+- **`mp_esdf_node` does not yet honour `mission_phase=ROTATING`** — v1.1 cleanup, tracked in INTEGRATION.md risks. For now, only `mp_node` is wired through `uav_brain` exploit/explore paths; `mp_esdf_node` is used standalone for benchmark runs.
 
 ---
 
 ## 4. TODO (sectioned)
 
-### 4.1 cuVSLAM-related TODO
+### 4.1 Safety layer
 
-1. **Phase 2 wiring** (per `PHASE2_VSLAM_INTEGRATION.md`):
-   - Gate static `map → odom` in `tf_static_broadcaster.cpp` behind `publish_map_to_odom` param
-   - Create `uav_bringup/config/vslam.yaml` with `vslam.enable`, `nvblox.enable`, `px4_feedback.enable`, `semantic.enable` master flags
-   - Create `uav_bringup/launch/vslam.launch.py` wrapping `singularity exec isaac_vslam.sif`
-   - Add `with_vslam:=false` arg to `full_stack.launch.py`
-2. **nvblox launch alongside cuVSLAM** — consume `/drone/rgbd/depth` + cuVSLAM pose; publish ESDF + occupancy
-3. **Drop OctoMap subscribers** in `uav_planner_interface` once nvblox publishes equivalents (Phase 3)
-4. **VSLAM Tracking Watchdog** — `uav_safety` package; monitors `visual_slam/status`, fires `/uav/emergency_trigger` on `vo_state != TRACKING` for >2s
-5. **(Component H, deferred)** PX4 visual odometry feedback — `vslam_to_px4_bridge` publishing to `/fmu/in/vehicle_visual_odometry`. Flag-gated; ships OFF; enable only after flight-validated tracking.
+1. **cmd_vel Mux** (`uav_safety/src/cmd_vel_mux.cpp`, ~70 lines) — when `/landing/enable: true`, suppress `/uav/cmd_vel` and forward `/landing/cmd_vel`. Wraps the bare `Twist` into `TwistStamped` (type mismatch with the landing node — see INTEGRATION risks).
+2. **VSLAM Tracking Watchdog** (`uav_safety/src/vslam_watchdog.cpp`) — monitor `visual_slam/status`, fire `/uav/emergency_trigger` after >2s of `vo_state != TRACKING`. Also forward to `SPF Orchestrator` so the active mission aborts cleanly.
+3. **Health Signal Adapters** (`uav_health_signals/*`):
+   - `/battery_percent` (`Float32`) ← `/fmu/out/battery_status`
+   - `/signal_ok` (`Bool`) ← PX4 commander state / RC freshness
+   - `/sensor_ok` (`Bool`) ← cuVSLAM status + per-sensor freshness aggregator
 
-### 4.2 Landing-related TODO
+### 4.2 Planner benchmark (per `PLANNER_BENCHMARK_DRAFT.md`)
 
-1. **Integrate `emergency_landing_node_px4` + `pixhawk_offboard_bridge`** into `planner_ws` (currently in `/home/shantam/irobot/emergency_landing_sim/`). Either copy into `planner_ws/uav_emergency_landing/` or expose the existing package via colcon.
-2. **Bottom sensor decision** (pick one):
-   - Add a 6th MaixSense, bottom-facing → exact match to landing teammate's URDF. Needs additional USB hub slot / cable.
-   - Remap D415's downward-aligned depth slice → `/sensor_bottom/depth/image_raw`. No new hardware; needs small TF + image extraction node.
-3. **Health Signal Adapters** (single new package `uav_health_signals`, ~150 lines total):
-   - `/battery_percent` (Float32) ← `/fmu/out/battery_status`
-   - `/signal_ok` (Bool) ← `/fmu/out/manual_control_input` freshness OR PX4 commander state
-   - `/sensor_ok` (Bool) ← aggregator watching cuVSLAM `visual_slam/status` + per-sensor topic freshness
-4. **cmd_vel Mux / Mode Arbiter** — when `/landing/enable: true`, suppress normal planner `/uav/cmd_vel` and forward landing's `/landing/cmd_vel`. **Critical type-mismatch caveat**: `mp_node` publishes `geometry_msgs/TwistStamped` on `/uav/cmd_vel`, but `emergency_landing_node_px4` publishes bare `geometry_msgs/Twist` on `/landing/cmd_vel`. Downstream `setpoint_publisher_node` expects TwistStamped. The mux must either wrap the bare Twist into a TwistStamped before emitting `/uav/cmd_vel_safe`, or `emergency_landing_node_px4` must be patched to publish TwistStamped. Pick the first (don't touch external landing code). Use stock `topic_tools` mux (cannot type-convert; rules out this option), or write a custom `uav_safety/src/cmd_vel_mux.cpp` (~70 lines with the type-wrap logic).
-5. **Sim → hardware validation** — run the landing FSM in Gazebo first (current state of the landing pkg), then port thresholds to hardware.
+1. **Phase B verification** — end-to-end smoke of `mp_esdf_node` with `with_vslam:=true planner_backend:=mp_esdf`. Currently blocked on Gazebo lag root-cause.
+2. **Phase D harness** — `uav_benchmark/` package: scenarios (straight_corridor, two_pillar_slalom, narrow_gap, dead_end_recovery, long_traverse), `run_comparison.py`, `analyse_bags.py`, `plot_results.py`.
+3. **Phase E** — 200 sim runs (2 configs × 5 scenarios × 20 seeds), report.
 
-### 4.3 See-Point-Fly related TODO
+### 4.3 Brain v1.1
 
-1. **Package `/Cuvslam/` scripts into `planner_ws/uav_vlm/`**:
-   - `vlm_api_inference_node.py` (OpenAI API variant) — keep
-   - `nanoowl_inference.py` (local variant) — keep
-   - `semantic_graph_combiner.py` — keep
-   - Add `package.xml`, `setup.py`, `launch/uav_vlm.launch.py`
-   - Update topic names: `/realsense/...` → `/drone/...` (match our existing convention)
-2. **User Instruction Interface** (~30 lines):
-   - New small Python node listening on `/user/instruction` (`std_msgs/String`)
-   - Operator publishes via `ros2 topic pub` or via a small Streamlit/Gradio web UI
-   - Alternative: ROS 2 service `/uav/go_to` (text in → success/failure out)
-3. **VLM Spatial Grounding Extension**:
-   - Extend `vlm_api_inference_node.py` with `mode: spatial_grounding`
-   - Prompt template: "Given this image and instruction '<text>', annotate a 2D waypoint where the drone should fly to, plus an estimated travel distance in meters."
-   - Output: `/spf/target_pose` (`geometry_msgs/PoseStamped`)
-4. **Waypoint Manager FSM upgrade** (the big architectural change — see `SEE_POINT_FLY_IMPLEMENTATION.md` §4.5):
-   - Pose-aware rotate-then-translate FSM inside `waypoint_manager_node.cpp` (~150-200 new lines)
-   - Upgrade `/uav/current_waypoint` topic type: `PointStamped` → `PoseStamped` (breaking change; only `mp_node` consumes today)
-   - New `/uav/mission_phase` (`std_msgs/String`) topic published every cycle: `IDLE | ROTATING | TRANSLATING | COMPLETE`
-   - `mp_node.cpp` updated to subscribe to `/uav/mission_phase`; hovers (zero cmd_vel) during ROTATING (~20 line addition)
-   - `setpoint_publisher_node.cpp` updated to subscribe to `/uav/mission_phase` and `/uav/current_waypoint`; emits yaw-only trajectory_setpoint (NaN velocity + target yaw) during ROTATING (~40 line addition)
-   - Optional companion fix: bump `setpoint_publisher_node` `cmd_timeout_s: 0.5 → 1.0` for more forgiving phase transitions
-5. **SPF Orchestrator** (now trivial, ~80 lines Python):
-   - Subscribes to `/spf/target_pose` and `/uav/emergency_trigger`
-   - On new target, sends full pose (with yaw) to `/uav/navigate_to_goal` action — rotation+translation handled by waypoint_manager internally
-   - Publishes `/uav/global_planner_status`: IDLE / EXECUTING / COMPLETE / ABORTED
-6. **Closed-loop vs one-shot decision** — start one-shot (VLM called once, target held); upgrade to closed-loop SPF (re-prompt after each phase) in v2. The new waypoint_manager-owned FSM makes closed-loop more tractable because SPF Orchestrator is decoupled from execution timing.
+1. **Lift `mission_phase` gate** out of `mp_node.cpp` into `MotionPrimitives` library so both `mp_node` and `mp_esdf_node` share it. Unblocks running the brain stack on the ESDF backend.
+2. **Async LLM call in brain** — current synchronous Ollama / OpenAI call blocks the spin loop. Move to a future-based async or a separate inference thread so the brain stays responsive while the LLM is thinking.
+3. **Redis failure fallback** — wrap Redis calls in `try/except`; on Redis down, route all instructions through the explore branch (graceful degradation).
+
+### 4.4 NanoOWL / semantic tuning
+
+1. **Engine rebuild on JetPack upgrade** — TensorRT engine at `/opt/nanoowl/data/owl_image_encoder_patch32.engine` is Jetson-specific. Document the rebuild step in deployment runbook.
+2. **Spatial merge radius tuning** — `spatial_merge_radius_m` (default 0.5 m in combiner) tends to over-merge when landmarks are clustered. Re-tune from real-flight data.
+3. **Dynamic prompt** — wire `/nanoowl/query` to a per-mission label set so we don't spend inference budget on irrelevant classes.
+
+### 4.5 PX4 visual odometry feedback (deferred)
+
+Component H of the master plan: `vslam_to_px4_bridge` publishing to `/fmu/in/vehicle_visual_odometry`. Flag-gated; ships OFF; enable only after tracking is validated in flight.
 
 ---
 
 ## 5. Out of scope (v1)
 
 - RTAB-Map (superseded by cuVSLAM + nvblox)
-- OctoMap (superseded by nvblox in Phase 3)
-- VFH3D node (legacy, scheduled for removal)
-- Temporal snapshots, experience replay buffer (report aspirational; no concrete scope)
-- PX4 vision odometry feedback (`/fmu/in/vehicle_visual_odometry`) — deferred until tracking validated in flight
-- RTAB-Map specific Knowledge Repository structure (replaced by cuVSLAM pose graph + nvblox + Semantic Pose Graph DB)
+- OctoMap (superseded by nvblox ESDF)
+- VFH3D node (legacy fallback only — gated behind `use_mp:=false`; not part of any active path)
+- EGO-Planner-v2 / MIGHTY / DWA-3D (rejected — see `PLANNER_ALTERNATIVES_REJECTED.md`)
 - Multi-drone coordination
-- Hardware GPS-denied flight (still relies on PX4 EKF2 + GPS; v1.1 with vision feedback enables this)
+- Hardware GPS-denied flight (deferred until Phase H visual-odometry feedback is validated)
+- Embedding-similarity fallback for fuzzy label match (Phase 5+, single-LLM brain handles it for now)
+- Voice / web UI for user input (stdin only in v1)
 
 ---
 
@@ -421,27 +399,42 @@ Key observations from the graph:
 
 - F450 frame, 4× motors + ESCs
 - Pixhawk FMU-V3 (or compatible) running PX4 v1.16.1
-- Jetson Orin Nano 8 GB (JetPack with ROS 2 Humble)
-- Intel RealSense D415, USB 3.0 cable
-- 5× MaixSense MS-A010 ToF (ring) + 1× MaixSense (bottom) OR D415 bottom-slice remap
-- USB hub (4 ports for 4 ring MaixSense; 5th ring + bottom direct to Orin)
+- **Jetson Orin Nano 8 GB** (JetPack + ROS 2 Humble; NanoOWL TensorRT engine; Redis server)
+- Intel RealSense D415, USB 3.0 cable (stereo IR for cuVSLAM, RGBD for nvblox + NanoOWL)
+- 5× MaixSense MS-A010 ToF (ring) + 1× MaixSense (bottom)
+- USB hub (sufficient ports for D415 + 6× MaixSense; observe USB-3 bandwidth on the D415 port)
 - Telemetry radio pair (SiK or equivalent) — TELEM1 to ground laptop QGC
 - WiFi for SSH + Foxglove streaming
 - Battery 4S (per F450 spec) with PX4-monitored voltage
 
 ---
 
-## 7. Glossary
+## 7. Deployment notes — Jetson Orin Nano
+
+- **Power mode**: MAXN (15 W) for inference + planner concurrency. Drops to 7 W mode are unsupported.
+- **Swap**: 8 GB swap required for one-time NanoOWL TensorRT engine builds (model loads ~ 6 GB peak). After the engine is built, runtime fits in RAM.
+- **Containers**: Isaac ROS (cuVSLAM + nvblox) runs inside `isaac_vslam.sif`. NanoOWL inference runs natively against the system-installed `nanoowl` Python package + TensorRT engine.
+- **DDS**: shared `ROS_DOMAIN_ID` between host (planner_ws) and Isaac container (cuVSLAM). Default `0`.
+- **Redis**: systemd unit `redis-server`, bound to `localhost:6379`. AOF persistence enabled so the landmark graph survives Orin reboots.
+- **Clock**: drop `use_sim_time` on the hardware deployment — `setpoint_publisher_node` and `px4_odom_bridge` use system wall-clock when PX4 is the time authority via uXRCE.
+- **GPU memory budget**: nvblox ESDF (~0.5 GB at 0.05 m voxel) + cuVSLAM (~1 GB) + NanoOWL B/32 FP16 (~0.2 GB inference, ~0.6 GB load peak) → headroom for the planner. Stays inside the 8 GB Orin Nano envelope.
+
+---
+
+## 8. Glossary
 
 | Term | Definition |
 |---|---|
-| MP | Motion Primitives — our Dynamic Planner v1 (`mp_node`) |
+| MP | Motion Primitives — Dynamic Planner v1 (`mp_node`) |
+| MP+ESDF | Same planner consuming nvblox ESDF (`mp_esdf_node`) |
 | cuVSLAM | NVIDIA's Isaac ROS visual SLAM (stereo + optional IMU) |
 | nvblox | NVIDIA's dense 3D occupancy + ESDF mapping |
 | ESDF | Euclidean Signed Distance Field — voxel grid encoding distance-to-nearest-obstacle |
-| VIO | Visual-Inertial Odometry |
+| NanoOWL | NVIDIA's TensorRT-optimised OWL-ViT open-vocabulary detector |
 | SPF | See, Point, Fly — VLM-driven navigation paradigm (arXiv:2509.22653) |
+| VIO | Visual-Inertial Odometry |
 | DDS | Data Distribution Service — uXRCE-DDS bridges PX4 ↔ ROS 2 |
 | FSM | Finite State Machine |
 | TF | ROS 2 transform tree |
 | ENU / NED | East-North-Up (ROS) / North-East-Down (PX4) — coordinate conventions |
+| Redis | In-memory key-value store hosting the semantic landmark graph |

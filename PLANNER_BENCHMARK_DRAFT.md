@@ -1,5 +1,32 @@
 # Plan — Motion Planner Benchmark: MP vs MP+ESDF (vs VFH3D+/ESDF, optional)
 
+## Status — 2026-05-17
+
+| Phase | State | Notes |
+|---|---|---|
+| A — nvblox ESDF queryable | **Done** | cuVSLAM (stereo, tracking_mode=0) + nvblox up via `vslam.launch.py`. Chosen topic: `/nvblox_node/static_esdf_pointcloud` (PointCloud2, intensity = signed distance, ~5–10 Hz, frame `map`). Local infra unblocked: Apptainer 1.19 + NVIDIA CDI working after CUDA driver reboot. |
+| B — MP + ESDF integration | **Done (impl), verification pending** | Implemented as a **separate** `mp_esdf_node` (per decision: do not modify `mp_node`). Library additions (`updateEsdf`, `esdfLookup`, `updateWithEsdf`, voxel-hash member) are additive on `MotionPrimitives` — `mp_node`'s code path untouched. Backend switch is a launch arg, **not** a YAML flag. |
+| B.5 verification | **Pending** | End-to-end smoke: `planner_backend:=mp_esdf` + `with_vslam:=true`, confirm `/uav/mp_diag` shows `esdf_mode=1.0` and `esdf_voxel_count > 0`, drone reaches a hand-sent waypoint. Blocked behind current Gazebo lag (see below). |
+| C — VFH3D+ + ESDF | **Skipped** | Decision: MP-only ablation is sufficient to answer the headline question. VFH3D path stays in tree as legacy fallback (`use_mp:=false`), not part of the benchmark. |
+| D — Benchmark harness | **Not started** | `uav_benchmark/` package, scenarios, automation, metrics, report. |
+| E — Run + analyze | **Not started** | 2 configs × 5 scenarios × 20 seeds = 200 runs. |
+
+**Implementation-vs-plan reconciliation (Phase B):** original draft proposed a `use_esdf` YAML flag toggling one binary. Final implementation is a second binary (`mp_esdf_node`) selected by `planner_backend:={mp, mp_esdf}` in `local_planner.launch.py`. Same `mp_params.yaml`, same scoring weights, same state machine — only the obstacle source differs (`/drone/rgbd/points` vs `/nvblox_node/static_esdf_pointcloud`). This change has no effect on the A/B comparison; it just trades a runtime flag for a build-time-selected executable, which keeps `mp_node.cpp` byte-for-byte stable across the benchmark.
+
+**Current blocker for resuming:** Gazebo sim lag after reverting cameras to 1280×720 (cuVSLAM rejected the earlier 640×480 downsize because `camera_info` still advertised 1280×720). Needs root-causing — likely either drop only the stereo pair to 480p (keep RGBD at 720p for the planner) or fix the camera_info publication to match the image dims.
+
+**Files actually shipped for Phase B:**
+- `uav_local_planner/include/uav_local_planner/motion_primitives.hpp` — added `updateEsdf()`, `esdfLookup()`, `updateWithEsdf()`, `esdfVoxelCount()`; `VoxelKey` + `VoxelKeyHash` (boost-style mixer); `esdf_voxels_` unordered_map; `esdf_voxel_size_{0.05}`.
+- `uav_local_planner/src/motion_primitives.cpp` — implementations; 20 samples/primitive in `updateWithEsdf`, body→world via `drone_pos + R(yaw)·p_body`, same hysteresis/pessimistic-temporal-filter/e-stop/scoring weights as cloud path.
+- `uav_local_planner/src/mp_esdf_node.cpp` — new (~330 lines); subscribes to `/nvblox_node/static_esdf_pointcloud`; same state machine (stall, orbit, recovery, slew-limit) as `mp_node`; diag publishes `esdf_mode=1.0` + `esdf_voxel_count`.
+- `uav_local_planner/CMakeLists.txt` — `add_executable(mp_esdf_node …)`, link to `motion_primitives`.
+- `uav_local_planner/launch/local_planner.launch.py` — added `planner_backend:={mp, mp_esdf}` launch arg; conditional `Node(...)` per backend; `mp_node` carries remap `/drone/tof_merged/points` → `/drone/rgbd/points` (D415-only mode).
+- `uav_local_planner/config/mp_params.yaml` — `history_subsample: 2 → 8` (D415 is denser than ToFs).
+
+**Not in `mp_node.cpp`:** confirmed unchanged — the baseline is byte-stable.
+
+---
+
 ## Context
 
 The current local planner (`mp_node` in `uav_local_planner`) is a custom 20 Hz motion-primitive avoidance loop that operates on a short raw-cloud history (no persistent map). The mid-term report commits to a "Dynamic Planner running at 50–60 Hz" for the inspection-by-drone use case — a target that today's MP doesn't comfortably hit, in part because per-cycle obstacle checks iterate a ~15k-point kdtree.

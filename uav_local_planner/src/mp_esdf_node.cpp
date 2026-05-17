@@ -24,7 +24,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
-#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
@@ -166,13 +166,63 @@ public:
     // ESDF cloud — best_effort matches nvblox's typical QoS for sensor-like topics.
     esdf_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         esdf_topic,
-        rclcpp::QoS(5).best_effort().durability_volatile(),
+        rclcpp::QoS(5).reliable().durability_volatile(),
         [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-          auto cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
-          pcl::fromROSMsg(*msg, *cloud);
+          // Decode by field name via PointCloud2Iterator — robust to any
+          // struct layout nvblox uses (avoids pcl::fromROSMsg's strict match).
+          // nvblox publishes the signed distance in a field that may be named
+          // "intensity" (current) or "signed_distance" (older builds); try both.
+          pcl::PointCloud<pcl::PointXYZI> cloud;
+          cloud.reserve(msg->width * msg->height);
+
+          // Empty cloud (width=0, no fields) is nvblox's normal "no surfaces
+          // observed in slice yet" state — mark alive, clear hash, proceed.
+          if (msg->width * msg->height == 0) {
+            std::lock_guard<std::mutex> lk(planner_mutex_);
+            planner_->updateEsdf(cloud, esdf_voxel_size_);  // empty → clears hash
+            have_esdf_ = true;
+            return;
+          }
+
+          bool has_x = false, has_y = false, has_z = false;
+          std::string dist_field;
+          for (const auto& f : msg->fields) {
+            if (f.name == "x") has_x = true;
+            else if (f.name == "y") has_y = true;
+            else if (f.name == "z") has_z = true;
+            else if (f.name == "intensity" || f.name == "signed_distance")
+              dist_field = f.name;
+          }
+          if (!has_x || !has_y || !has_z) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "ESDF cloud has %u points but missing x/y/z fields (got %zu fields) — dropping",
+                msg->width * msg->height, msg->fields.size());
+            return;
+          }
+
+          sensor_msgs::PointCloud2ConstIterator<float> it_x(*msg, "x");
+          sensor_msgs::PointCloud2ConstIterator<float> it_y(*msg, "y");
+          sensor_msgs::PointCloud2ConstIterator<float> it_z(*msg, "z");
+          if (dist_field.empty()) {
+            // No distance field — store zero-distance occupancy (treat all
+            // published voxels as on-obstacle surface).
+            for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z) {
+              pcl::PointXYZI p;
+              p.x = *it_x; p.y = *it_y; p.z = *it_z; p.intensity = 0.0f;
+              cloud.push_back(p);
+            }
+          } else {
+            sensor_msgs::PointCloud2ConstIterator<float> it_d(*msg, dist_field);
+            for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z, ++it_d) {
+              pcl::PointXYZI p;
+              p.x = *it_x; p.y = *it_y; p.z = *it_z; p.intensity = *it_d;
+              cloud.push_back(p);
+            }
+          }
+
           {
             std::lock_guard<std::mutex> lk(planner_mutex_);
-            planner_->updateEsdf(*cloud, esdf_voxel_size_);
+            planner_->updateEsdf(cloud, esdf_voxel_size_);
           }
           have_esdf_ = true;
         });

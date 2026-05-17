@@ -60,12 +60,16 @@ def generate_launch_description():
 
         # 4. Static stereo camera_info publisher — workaround for Gazebo Harmonic
         #    not emitting CameraInfo. Intrinsics match the SDF stereo IR pair
-        #    (D415-equivalent: 1280x720, 65 deg HFOV, 55 mm baseline).
+        #    (D415-equivalent: 640x480, 65 deg HFOV, 55 mm baseline).
         Node(
             package='uav_depth_fusion',
             executable='stereo_camera_info_publisher',
             name='stereo_camera_info_publisher',
             output='screen',
-            parameters=[{'use_sim_time': True}],
+            parameters=[{
+                'use_sim_time': True,
+                'width': 640,
+                'height': 480,
+            }],
         ),
     ])

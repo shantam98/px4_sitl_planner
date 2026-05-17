@@ -11,6 +11,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     use_mp              = LaunchConfiguration('use_mp',              default='true')
+    planner_backend     = LaunchConfiguration('planner_backend',     default='mp')
     with_global_planner = LaunchConfiguration('with_global_planner', default='true')
     with_vslam          = LaunchConfiguration('with_vslam',          default='false')
 
@@ -38,6 +39,11 @@ def generate_launch_description():
             description='true = Motion Primitive planner, false = legacy VFH3D'),
 
         DeclareLaunchArgument(
+            'planner_backend', default_value='mp',
+            description='MP variant when use_mp:=true: "mp" (raw-cloud baseline) '
+                        'or "mp_esdf" (nvblox ESDF). Requires with_vslam:=true for ESDF.'),
+
+        DeclareLaunchArgument(
             'with_global_planner', default_value='true',
             description='Launch OctoMap + A* global planner (required for nav goals).'),
 
@@ -62,7 +68,10 @@ def generate_launch_description():
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(local_dir, 'launch', 'local_planner.launch.py')),
-                launch_arguments={'use_mp': use_mp}.items())]),
+                launch_arguments={
+                    'use_mp': use_mp,
+                    'planner_backend': planner_backend,
+                }.items())]),
 
         # ── T = 3 s : OctoMap (only when VSLAM is OFF) ────────────────────
         # nvblox replaces OctoMap when with_vslam:=true.

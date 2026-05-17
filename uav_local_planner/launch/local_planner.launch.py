@@ -13,12 +13,19 @@ def generate_launch_description():
 
     use_mp           = LaunchConfiguration('use_mp',           default='true')
     planner_backend  = LaunchConfiguration('planner_backend',  default='mp')
+    sensor_source    = LaunchConfiguration('sensor_source',    default='d415')
 
     # Condition helpers — only one MP-family node runs at a time.
     is_mp_baseline = PythonExpression([
         "'", use_mp, "' == 'true' and '", planner_backend, "' == 'mp'"])
     is_mp_esdf = PythonExpression([
         "'", use_mp, "' == 'true' and '", planner_backend, "' == 'mp_esdf'"])
+
+    # Sensor source for the mp baseline: 'd415' remaps to the D415 RGBD cloud,
+    # 'fusion' keeps the default /drone/tof_merged/points (5x ring ToFs merged).
+    # Implemented as a remap target: self-remap is a no-op so fusion = identity.
+    mp_cloud_topic = PythonExpression([
+        "'/drone/rgbd/points' if '", sensor_source, "' == 'd415' else '/drone/tof_merged/points'"])
 
     return LaunchDescription([
 
@@ -33,6 +40,14 @@ def generate_launch_description():
                 '"mp" (raw-cloud baseline) or "mp_esdf" (nvblox ESDF voxel hash).'
                 'For the ESDF variant, ensure cuVSLAM+nvblox stack is up '
                 'and publishing /nvblox_node/static_esdf_pointcloud.')),
+
+        DeclareLaunchArgument(
+            'sensor_source', default_value='d415',
+            description=(
+                'Obstacle cloud source for planner_backend:=mp. '
+                '"d415" = forward-facing RGBD only (~65 deg FOV, long range). '
+                '"fusion" = 5x ring ToFs merged in base_link (~360 deg, ~3 m range). '
+                'Ignored for planner_backend:=mp_esdf (always uses nvblox ESDF).')),
 
         Node(
             package='uav_local_planner',
@@ -49,7 +64,9 @@ def generate_launch_description():
         ),
 
         # ── Motion Primitive — raw cloud baseline ─────────────────────────
-        # planner_backend:=mp (default). Reads /drone/tof_merged/points.
+        # planner_backend:=mp (default). Obstacle cloud source picked by
+        # sensor_source:={d415,fusion}. Self-remap (fusion → fusion) is a no-op
+        # so we can use a single Node block for both configs.
         Node(
             condition=IfCondition(is_mp_baseline),
             package='uav_local_planner',
@@ -57,6 +74,9 @@ def generate_launch_description():
             name='mp_node',
             output='screen',
             parameters=[mp_config, {'use_sim_time': True}],
+            remappings=[
+                ('/drone/tof_merged/points', mp_cloud_topic),
+            ],
         ),
 
         # ── Motion Primitive — nvblox ESDF variant ────────────────────────

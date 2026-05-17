@@ -43,11 +43,14 @@ mp_node:
     # always overrides this regardless of the counter.
     bypass_min_hold_cycles: 60
 
-    # ── Temporal point buffer ────────────────────────────��────────────────
+    # ── Temporal point buffer ────────────────────────────────────────────
     # Circular FIFO in base_link frame. Covers sensor blind spots during yaw.
     # Memory ≈ history_capacity × 12 bytes  (default: 16384 × 12 = 192 KB)
     history_capacity:  16384     # max stored points
-    history_subsample: 2         # keep 1-in-N from each incoming cloud
+    # history_subsample bumped 2 → 8 because the D415 cloud is dense
+    # (~640×480 = 307k points/cycle). At 8 we keep ~38k per cycle,
+    # comparable in volume to the old ToF cloud (~5×100²=50k).
+    history_subsample: 8
 
     # ── Pessimistic obstacle distance filter ────────────────────────────────
     # Temporal-min window over closest_obstacle_dist; smooths high-frequency
